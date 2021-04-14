@@ -14,6 +14,18 @@ const cellHeight = canvasHeight / gridHeight | 0;
 let currentState = new Uint8Array(gridWidth * gridHeight);
 const nextState = new Uint8Array(gridWidth * gridHeight);
 
+const materials = new Map();
+materials.set(100, '#afa971');
+materials.set(101, '#c5bf87');
+materials.set(102, '#dbd59e');
+materials.set(103, '#e3dda5');
+materials.set(104, '#beb781');
+materials.set(105, '#d2cb94');
+materials.set(106, '#cfc892');
+materials.set(107, '#d6cf98');
+materials.set(108, '#d6cf98');
+materials.set(109, '#c9c08f');
+
 function xyToI(x, y) {
     if (x < 0) return null;
     if (x >= gridWidth) return null;
@@ -37,9 +49,9 @@ function setRandomCellOn() {
     // for (let i = 0; i < gridWidth; i++) {
     //     currentState[i] = Math.random() < 0.05 ? 1 : 0;
     // }
-    currentState[63] = Math.random() < 0.05 ? 1 : 0;
-    currentState[64] = Math.random() < 0.05 ? 1 : 0;
-    currentState[65] = Math.random() < 0.05 ? 1 : 0;
+    currentState[63] = Math.random() < 0.05 ? (Math.floor(Math.random() * 9) + 100) : 0;
+    currentState[64] = Math.random() < 0.05 ? (Math.floor(Math.random() * 9) + 100) : 0;
+    currentState[65] = Math.random() < 0.05 ? (Math.floor(Math.random() * 9) + 100) : 0;
 }
 
 
@@ -81,22 +93,22 @@ function doStep() {
         for (let x = 0; x < gridWidth; x++) {
             const i5 = xyToI(x, y);
             const s5 = currentState[i5];
-            if (s5 === 1) {
+            if (s5 > 0) {
                 const { s1, s2, s3, i1, i2, i3 } = getNeighborCells(i5);
                 if (s2 === 0) {
-                    nextState[i2] = 1;
+                    nextState[i2] = s5;
                     continue;
                 } else if (s1 === 0 && s3 === 0) {
-                    nextState[Math.random() < 0.5 ? i1 : i3] = 1;
+                    nextState[Math.random() < 0.5 ? i1 : i3] = s5;
                     continue;
                 } else if (s1 === 0) {
-                    nextState[i1] = 1;
+                    nextState[i1] = s5;
                     continue;
                 } else if (s3 === 0) {
-                    nextState[i3] = 1;
+                    nextState[i3] = s5;
                     continue;
                 } else {
-                    nextState[i5] = 1;
+                    nextState[i5] = s5;
                 }
             }
         }
@@ -106,7 +118,7 @@ function doStep() {
 
 function initialize() {
     currentState.fill(0);
-    worker.postMessage(['initialize', cellWidth, cellHeight, canvasWidth, canvasHeight, gridWidth, gridHeight, canvas], [canvas]);
+    worker.postMessage(['initialize', cellWidth, cellHeight, canvasWidth, canvasHeight, gridWidth, gridHeight, canvas, materials], [canvas]);
     worker.postMessage(['setPos', currentState]);
     worker.postMessage(['animate']);
 }
