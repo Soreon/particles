@@ -4,3 +4,26 @@ canvas {
     image-rendering: pixelated;
     image-rendering: crisp-edges;
 }
+
+body {
+  display: flex;
+}
+
+#infos {
+  display: inline-block;
+  flex: 1;
+  font-family: monospace;
+}
+
+.infoRow {
+  display: flex;
+}
+
+.infoLabel {
+  flex: 1;
+  max-width: 100px;
+}
+
+.infoValue {
+  flex: 1;
+}
