@@ -59,7 +59,7 @@ function getRandomMaterial(array) {
   let max = -Infinity;
 
   materials.forEach((e, k) => {
-    if(array.includes(e.name)) {
+    if (array.includes(e.name)) {
       min = Math.min(min, k);
       max = Math.max(max, k);
     }
@@ -72,7 +72,7 @@ function setRandomCellOn() {
   // for (let i = 0; i < gridWidth; i++) {
   //     currentState[i] = Math.random() < 0.05 ? 1 : 0;
   // }
-  const array = ['sand'];
+  const array = ['sand', 'water'];
   currentState[63] = Math.random() < 0.25 ? getRandomMaterial(array) : 0;
   currentState[64] = Math.random() < 0.25 ? getRandomMaterial(array) : 0;
   currentState[65] = Math.random() < 0.25 ? getRandomMaterial(array) : 0;
@@ -116,44 +116,42 @@ function doStepWater(i5, s5) {
   } = getNeighborCells(i5);
 
   if (s2 === 0 && nextState[i2] === 0) {
-    nextState[i2] = s5;
-    return;
-  }
-
-  if (s1 === 0 && s3 === 0) {
+    if (nextState[i2] === 0) {
+      nextState[i2] = s5;
+      return;
+    }
+  } else if (s1 === 0 && s3 === 0) {
     const ia = Math.random() < 0.5 ? i1 : i3;
     if (nextState[ia] === 0) {
       nextState[ia] = s5;
       return;
     }
-  }
-
-  if (s1 === 0 && nextState[i1] === 0) {
-    nextState[i1] = s5;
-    return;
-  }
-
-  if (s3 === 0 && nextState[i3] === 0) {
-    nextState[i3] = s5;
-    return;
-  }
-
-  if (s4 === 0 && s6 === 0) {
+  } else if (s1 === 0 && nextState[i1] === 0) {
+    if (nextState[i1] === 0) {
+      nextState[i1] = s5;
+      return;
+    }
+  } else if (s3 === 0 && nextState[i3] === 0) {
+    if (nextState[i3] === 0) {
+      nextState[i3] = s5;
+      return;
+    }
+  } else if (s4 === 0 && s6 === 0) {
     const ir = Math.random() < 0.5 ? i4 : i6;
     if (nextState[ir] === 0) {
       nextState[ir] = s5;
       return;
     }
-  }
-
-  if (s4 === 0 && nextState[i4] === 0) {
-    nextState[i4] = s5;
-    return;
-  }
-
-  if (s6 === 0 && nextState[i6] === 0) {
-    nextState[i6] = s5;
-    return;
+  } else if (s4 === 0 && nextState[i4] === 0) {
+    if (nextState[i4] === 0) {
+      nextState[i4] = s5;
+      return;
+    }
+  } else if (s6 === 0 && nextState[i6] === 0) {
+    if (nextState[i6] === 0) {
+      nextState[i6] = s5;
+      return;
+    }
   }
   nextState[i5] = s5;
 }
@@ -163,18 +161,40 @@ function doStepSand(i5, s5) {
     s1, s2, s3, i1, i2, i3,
   } = getNeighborCells(i5);
   if (s2 === 0) {
-    nextState[i2] = s5;
-  } else if (s2 !== null && materials.get(s5).density > materials.get(s2).density) {
+    if(nextState[i2] === 0) {
+      nextState[i2] = s5;
+      return;
+    }
+  } /* else if (s2 !== null && materials.get(s5).density > materials.get(s2).density) {
     nextState[i2] = s5;
     nextState[i5] = s2;
-  } else if (s1 === 0 && s3 === 0) {
-    nextState[Math.random() < 0.5 ? i1 : i3] = s5;
+  }*/ else if (s1 === 0 && s3 === 0) {
+    const ir = Math.random() < 0.5 ? i1 : i3;
+    if(nextState[ir] === 0) {
+      nextState[ir] = s5;
+      return;
+    }
   } else if (s1 === 0) {
-    nextState[i1] = s5;
+    if(nextState[i1] === 0) {
+      nextState[i1] = s5;
+      return;
+    }
   } else if (s3 === 0) {
-    nextState[i3] = s5;
-  } else {
-    nextState[i5] = s5;
+    if(nextState[i3] === 0) {
+      nextState[i3] = s5;
+      return;
+    }
+  }
+  nextState[i5] = s5;
+}
+
+function doStepDensity(i5, s5) {
+  const {
+    s2, s8, i8
+  } = getNeighborCells(i5);
+  if ((s2 === null || s2 !== 0) && s8 !== null && materials.get(s8).density > materials.get(s5).density) {
+    nextState[i5] = s8;
+    nextState[i8] = s5;
   }
 }
 
@@ -203,6 +223,13 @@ function doStep() {
       }
     }
   }
+  for (let y = 0; y < gridHeight; y += 1) {
+    for (let x = 0; x < gridWidth; x += 1) {
+      const i5 = xyToI(x, y);
+      const s5 = currentState[i5];
+      doStepDensity(i5, s5);
+    }
+  }
   currentState = [...nextState];
 }
 
@@ -215,17 +242,17 @@ function initialize() {
 
 
 function eraseCellAtPixelPosition(x, y) {
-    const { top, left } = document.getElementById('canvas').getBoundingClientRect();
-  
-    const posX = Math.floor(((x - left) / canvasWidth) * gridWidth);
-    const posY = Math.floor(((y - top) / canvasHeight) * gridHeight);
-  
-    currentState[xyToI(posX, posY)] = 0;
+  const { top, left } = document.getElementById('canvas').getBoundingClientRect();
+
+  const posX = Math.floor(((x - left) / canvasWidth) * gridWidth);
+  const posY = Math.floor(((y - top) / canvasHeight) * gridHeight);
+
+  currentState[xyToI(posX, posY)] = 0;
 }
 
 document.getElementById('canvas').addEventListener('mousedown', () => { mouse.dragging = true; });
 document.getElementById('canvas').addEventListener('mouseup', () => { mouse.dragging = false; });
-document.getElementById('canvas').addEventListener('mousemove', (e) => { 
+document.getElementById('canvas').addEventListener('mousemove', (e) => {
   mouse.x = e.clientX;
   mouse.y = e.clientY;
 });
@@ -239,7 +266,7 @@ initialize();
 setInterval(() => {
   setRandomCellOn();
   doStep();
-  if(mouse.dragging) eraseCellAtPixelPosition(mouse.x, mouse.y);
+  if (mouse.dragging) eraseCellAtPixelPosition(mouse.x, mouse.y);
   displayDebug();
   worker.postMessage(['setPos', currentState]);
-}, 25);
+}, 10);
