@@ -16,18 +16,18 @@ const cellHeight = Math.floor(canvasHeight / gridHeight);
 let currentState = new Uint8Array(gridWidth * gridHeight);
 const nextState = new Uint8Array(gridWidth * gridHeight);
 
-let mouse = {
+const mouse = {
   x: 0,
   y: 0,
   dragging: false,
-}
+};
 
-let debugData = {
+const debugData = {
   count: {
     water: 0,
     sand: 0,
-  }
-}
+  },
+};
 
 function getRandomIntInclusive(_min, _max) {
   const min = Math.ceil(_min);
@@ -112,7 +112,7 @@ function getNeighborCells(i) {
 
 function doStepWater(i5, s5) {
   const {
-    s1, s2, s3, s4, s6, s8, i1, i2, i3, i4, i6,
+    s1, s2, s3, s4, s6, i1, i2, i3, i4, i6,
   } = getNeighborCells(i5);
 
   if (s2 === 0 && nextState[i2] === 0) {
@@ -161,26 +161,23 @@ function doStepSand(i5, s5) {
     s1, s2, s3, i1, i2, i3,
   } = getNeighborCells(i5);
   if (s2 === 0) {
-    if(nextState[i2] === 0) {
+    if (nextState[i2] === 0) {
       nextState[i2] = s5;
       return;
     }
-  } /* else if (s2 !== null && materials.get(s5).density > materials.get(s2).density) {
-    nextState[i2] = s5;
-    nextState[i5] = s2;
-  }*/ else if (s1 === 0 && s3 === 0) {
+  } else if (s1 === 0 && s3 === 0) {
     const ir = Math.random() < 0.5 ? i1 : i3;
-    if(nextState[ir] === 0) {
+    if (nextState[ir] === 0) {
       nextState[ir] = s5;
       return;
     }
   } else if (s1 === 0) {
-    if(nextState[i1] === 0) {
+    if (nextState[i1] === 0) {
       nextState[i1] = s5;
       return;
     }
   } else if (s3 === 0) {
-    if(nextState[i3] === 0) {
+    if (nextState[i3] === 0) {
       nextState[i3] = s5;
       return;
     }
@@ -190,11 +187,22 @@ function doStepSand(i5, s5) {
 
 function doStepDensity(i5, s5) {
   const {
-    s2, s8, i8
+    i1, s1, i2, s2, i3, s3,
   } = getNeighborCells(i5);
-  if ((s2 === null || s2 !== 0) && s8 !== null && materials.get(s8).density > materials.get(s5).density) {
-    nextState[i5] = s8;
-    nextState[i8] = s5;
+  if (s2 > 0 && materials.get(s5).density > materials.get(s2).density) {
+    nextState[i2] = s5;
+    nextState[i5] = s2;
+  } else if (s1 > 0 && s3 > 0 && materials.get(s5).density > materials.get(s1).density && materials.get(s5).density > materials.get(s3).density) {
+    const ir = Math.random() < 0.5 ? i1 : i3;
+    const sr = currentState[ir];
+    nextState[ir] = s5;
+    nextState[i5] = sr;
+  } else if (s1 > 0 && materials.get(s5).density > materials.get(s1).density) {
+    nextState[i1] = s5;
+    nextState[i5] = s1;
+  } else if (s3 > 0 && materials.get(s5).density > materials.get(s3).density) {
+    nextState[i3] = s5;
+    nextState[i5] = s3;
   }
 }
 
@@ -223,6 +231,7 @@ function doStep() {
       }
     }
   }
+  currentState = [...nextState];
   for (let y = 0; y < gridHeight; y += 1) {
     for (let x = 0; x < gridWidth; x += 1) {
       const i5 = xyToI(x, y);
@@ -239,7 +248,6 @@ function initialize() {
   worker.postMessage(['setPos', currentState]);
   worker.postMessage(['animate']);
 }
-
 
 function eraseCellAtPixelPosition(x, y) {
   const { top, left } = document.getElementById('canvas').getBoundingClientRect();
