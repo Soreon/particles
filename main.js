@@ -156,6 +156,24 @@ function doStepWater(i5, s5) {
   nextState[i5] = s5;
 }
 
+/** TODO: Inverser le fonctionnement de step
+ *  Si on imagine 9 cellules :
+ * ┌─────┬─────┬─────┐
+ * │  7  │  8  │  9  │
+ * ├─────┼─────┼─────┤
+ * │  4  │  5  │  6  │
+ * ├─────┼─────┼─────┤
+ * │  1  │  2  │  3  │
+ * └─────┴─────┴─────┘
+ * L'ordre de parcours et 7 8 9 4 5 6 1 2 3
+ * La règle du s3 de la case 7 s'applique avant la règle s2 de la case 8
+ * On raisonne actuellement du point de vue des particules.
+ * Il faudrait raisonner d'un point de vue cellule (emplacement).
+ * Le fait d'inverser le fonctionnement nececite de créer un nouveau système.
+ * EX: En reprenant la grille, si 2 et 3 sont vides, la case 6 pourrait activer la
+ * régle s9 de 2 et la règle s8 de 3.
+ * Il faut un moyen de flaguer les particules déjà gérés (grille intermediaire ?)
+ */
 function doStepSand(i5, s5) {
   const {
     s1, s2, s3, i1, i2, i3,
