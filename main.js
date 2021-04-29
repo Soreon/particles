@@ -50,7 +50,7 @@ function iToXy(i) {
 
   const n = i / gridWidth;
   const y = Math.floor(n);
-  const x = (n - y) * gridWidth;
+  const x = Math.round((n - y) * gridWidth);
   return [x, y];
 }
 
