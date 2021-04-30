@@ -14,8 +14,8 @@ function initialize(_gridWidth, _gridHeight, _materials, _messageChannel) {
   gridWidth = _gridWidth;
   gridHeight = _gridHeight;
   materials = _materials;
-  currentState = new Uint8Array(gridWidth * gridHeight);
-  nextState = new Uint8Array(gridWidth * gridHeight);
+  currentState = new Uint16Array(gridWidth * gridHeight);
+  nextState = new Uint16Array(gridWidth * gridHeight);
   messageChannel = _messageChannel;
   currentState.fill(0);
 }
@@ -183,6 +183,35 @@ function doStepDensity(i5, s5) {
     nextState[i3] = s5;
     nextState[i5] = s3;
   }
+}
+
+function doStepMaterial(i5, s5) {
+  const {
+    s1, s2, s3, i1, i2, i3,
+  } = getNeighborCells(i5);
+  if (s2 === 0) {
+    if (nextState[i2] === 0) {
+      nextState[i2] = s5;
+      return;
+    }
+  } else if (s1 === 0 && s3 === 0) {
+    const ir = Math.random() < 0.5 ? i1 : i3;
+    if (nextState[ir] === 0) {
+      nextState[ir] = s5;
+      return;
+    }
+  } else if (s1 === 0) {
+    if (nextState[i1] === 0) {
+      nextState[i1] = s5;
+      return;
+    }
+  } else if (s3 === 0) {
+    if (nextState[i3] === 0) {
+      nextState[i3] = s5;
+      return;
+    }
+  }
+  nextState[i5] = s5;
 }
 
 function doStep() {
