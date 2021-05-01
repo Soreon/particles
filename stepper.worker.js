@@ -39,6 +39,10 @@ function iToXy(i) {
   return [x, y];
 }
 
+function density(s) {
+  return materials.get(s)?.density ?? 0;
+}
+
 function getNeighborCells(i) {
   const [x, y] = iToXy(i);
   const i1 = xyToI(x - 1, y + 1);
@@ -73,7 +77,7 @@ function getNeighborCells(i) {
 
 function doStepWater(i5, s5) {
   const {
-    s1, s2, s3, s4, s6, i1, i2, i3, i4, i6,
+    s1, s2, s3, s4, s6, i1, i2, i3, i4, i6, s7, s9,
   } = getNeighborCells(i5);
 
   if (s2 === 0 && nextState[i2] === 0) {
@@ -81,34 +85,34 @@ function doStepWater(i5, s5) {
       nextState[i2] = s5;
       return;
     }
-  } else if (s1 === 0 && s3 === 0) {
+  } else if (s1 === 0 && s3 === 0 && s4 === 0 && s6 === 0) {
     const ia = Math.random() < 0.5 ? i1 : i3;
     if (nextState[ia] === 0) {
       nextState[ia] = s5;
       return;
     }
-  } else if (s1 === 0 && nextState[i1] === 0) {
+  } else if (s1 === 0 && nextState[i1] === 0 && s4 === 0) {
     if (nextState[i1] === 0) {
       nextState[i1] = s5;
       return;
     }
-  } else if (s3 === 0 && nextState[i3] === 0) {
+  } else if (s3 === 0 && nextState[i3] === 0 && s6 === 0) {
     if (nextState[i3] === 0) {
       nextState[i3] = s5;
       return;
     }
-  } else if (s4 === 0 && s6 === 0) {
+  } else if (s4 === 0 && s6 === 0 && s7 === 0 && s9 === 0) {
     const ir = Math.random() < 0.5 ? i4 : i6;
     if (nextState[ir] === 0) {
       nextState[ir] = s5;
       return;
     }
-  } else if (s4 === 0 && nextState[i4] === 0) {
+  } else if (s4 === 0 && nextState[i4] === 0 && s7 === 0) {
     if (nextState[i4] === 0) {
       nextState[i4] = s5;
       return;
     }
-  } else if (s6 === 0 && nextState[i6] === 0) {
+  } else if (s6 === 0 && nextState[i6] === 0 && s9 === 0) {
     if (nextState[i6] === 0) {
       nextState[i6] = s5;
       return;
@@ -117,45 +121,27 @@ function doStepWater(i5, s5) {
   nextState[i5] = s5;
 }
 
-/** TODO: Inverser le fonctionnement de step
- *  Si on imagine 9 cellules :
- * ┌─────┬─────┬─────┐
- * │  7  │  8  │  9  │
- * ├─────┼─────┼─────┤
- * │  4  │  5  │  6  │
- * ├─────┼─────┼─────┤
- * │  1  │  2  │  3  │
- * └─────┴─────┴─────┘
- * L'ordre de parcours et 7 8 9 4 5 6 1 2 3
- * La règle du s3 de la case 7 s'applique avant la règle s2 de la case 8
- * On raisonne actuellement du point de vue des particules.
- * Il faudrait raisonner d'un point de vue cellule (emplacement).
- * Le fait d'inverser le fonctionnement nececite de créer un nouveau système.
- * EX: En reprenant la grille, si 2 et 3 sont vides, la case 6 pourrait activer la
- * régle s9 de 2 et la règle s8 de 3.
- * Il faut un moyen de flaguer les particules déjà gérés (grille intermediaire ?)
- */
 function doStepSand(i5, s5) {
   const {
-    s1, s2, s3, i1, i2, i3,
+    s1, s2, s3, i1, i2, i3, s4, s6,
   } = getNeighborCells(i5);
   if (s2 === 0) {
     if (nextState[i2] === 0) {
       nextState[i2] = s5;
       return;
     }
-  } else if (s1 === 0 && s3 === 0) {
+  } else if (s1 === 0 && s3 === 0 && s4 === 0 && s6 === 0) {
     const ir = Math.random() < 0.5 ? i1 : i3;
     if (nextState[ir] === 0) {
       nextState[ir] = s5;
       return;
     }
-  } else if (s1 === 0) {
+  } else if (s1 === 0 && s4 === 0) {
     if (nextState[i1] === 0) {
       nextState[i1] = s5;
       return;
     }
-  } else if (s3 === 0) {
+  } else if (s3 === 0 && s6 === 0) {
     if (nextState[i3] === 0) {
       nextState[i3] = s5;
       return;
@@ -166,52 +152,24 @@ function doStepSand(i5, s5) {
 
 function doStepDensity(i5, s5) {
   const {
-    i1, s1, i2, s2, i3, s3,
+    i1, s1, i2, s2, i3, s3, s4, s6,
   } = getNeighborCells(i5);
-  if (s2 > 0 && materials.get(s5).density > materials.get(s2).density) {
+  if (s5 === 0) return;
+  if (s2 > 0 && density(s5) > density(s2)) {
     nextState[i2] = s5;
     nextState[i5] = s2;
-  } else if (s1 > 0 && s3 > 0 && materials.get(s5).density > materials.get(s1).density && materials.get(s5).density > materials.get(s3).density) {
+  } else if (s1 > 0 && s4 > 0 && s3 > 0 && s6 > 0 && density(s5) > density(s1) && density(s5) > density(s4) && density(s5) > density(s3) && density(s5) > density(s6)) {
     const ir = Math.random() < 0.5 ? i1 : i3;
     const sr = currentState[ir];
     nextState[ir] = s5;
     nextState[i5] = sr;
-  } else if (s1 > 0 && materials.get(s5).density > materials.get(s1).density) {
+  } else if (s1 > 0 && s4 > 0 && density(s5) > density(s1) && density(s5) > density(s4)) {
     nextState[i1] = s5;
     nextState[i5] = s1;
-  } else if (s3 > 0 && materials.get(s5).density > materials.get(s3).density) {
+  } else if (s3 > 0 && s6 > 0 && density(s5) > density(s3) && density(s5) > density(s6)) {
     nextState[i3] = s5;
     nextState[i5] = s3;
   }
-}
-
-function doStepMaterial(i5, s5) {
-  const {
-    s1, s2, s3, i1, i2, i3,
-  } = getNeighborCells(i5);
-  if (s2 === 0) {
-    if (nextState[i2] === 0) {
-      nextState[i2] = s5;
-      return;
-    }
-  } else if (s1 === 0 && s3 === 0) {
-    const ir = Math.random() < 0.5 ? i1 : i3;
-    if (nextState[ir] === 0) {
-      nextState[ir] = s5;
-      return;
-    }
-  } else if (s1 === 0) {
-    if (nextState[i1] === 0) {
-      nextState[i1] = s5;
-      return;
-    }
-  } else if (s3 === 0) {
-    if (nextState[i3] === 0) {
-      nextState[i3] = s5;
-      return;
-    }
-  }
-  nextState[i5] = s5;
 }
 
 function doStep() {

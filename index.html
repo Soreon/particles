@@ -1,18 +1,25 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-    <meta charset="UTF-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document</title>
+  <link rel="stylesheet" href="style.css">
 </head>
+
 <body>
+  <div class="row">
     <canvas id="canvas" width="800" height="800"></canvas>
-    <div id='infos'>
-      <div class='infoRow'><span class='infoLabel'>Water: </span><span id='waterCount' class='infoValue'></span></div>
-      <div class='infoRow'><span class='infoLabel'>Sand: </span><span id='sandCount' class='infoValue'></span></div>
+    <div id="debug">
+      <div class="debugRow"><span class="debugLabel">Tool: </span><span id="tool" class="debugValue"></span></div>
+      <div class="debugRow"><span class="debugLabel">Water: </span><span id="waterCount" class="debugValue"></span></div>
+      <div class="debugRow"><span class="debugLabel">Sand: </span><span id="sandCount" class="debugValue"></span></div>
     </div>
-    <script type="module" src="main.js"></script>
+  </div>
+  <div id="infos" class="row">Wheel: change tool,&nbsp;&nbsp;&nbsp;&nbsp;CTRL + Wheel: change tool size</div>
+  <script type="module" src="main.js"></script>
 </body>
+
 </html>
