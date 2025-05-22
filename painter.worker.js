@@ -15,42 +15,131 @@ let materials = null;
 let messageChannel = null;
 let mouse = null;
 
+// Variables pour le rendu optimisé avec ImageData
+let imageData = null;
+let imageDataBuffer = null;
+let materialColors = null;
+
 // Variables pour le calcul des FPS
 let frameCount = 0;
 let lastTime = performance.now();
 let fps = 0;
 
-function drawGrid() {
-  if (currentState === null) return;
-  context.clearRect(0, 0, canvasWidth, canvasHeight);
-  for (let y = 0; y < gridHeight; y += 1) {
-    for (let x = 0; x < gridWidth; x += 1) {
-      const p = currentState[(y * gridWidth) + x];
-      if (p > 0) {
-        context.fillStyle = materials.get(p).color;
-        context.fillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight);
-      }
+/**
+ * Pré-calcule toutes les couleurs des matériaux en format RGBA 32-bit
+ */
+function precomputeMaterialColors() {
+  const maxMaterialId = Math.max(...materials.keys());
+  materialColors = new Uint32Array(maxMaterialId + 1);
+  
+  materials.forEach((material, id) => {
+    if (material.color) {
+      // Convertir couleur hex en RGBA 32-bit (format ABGR pour little-endian)
+      const hex = material.color.slice(1); // Supprimer le #
+      const r = parseInt(hex.slice(0, 2), 16);
+      const g = parseInt(hex.slice(2, 4), 16);
+      const b = parseInt(hex.slice(4, 6), 16);
+      const a = 255; // Alpha opaque
+      
+      // Format ABGR pour compatibilité little-endian
+      materialColors[id] = (a << 24) | (b << 16) | (g << 8) | r;
+    } else {
+      materialColors[id] = 0; // Transparent pour void
+    }
+  });
+}
+
+/**
+ * Remplit un bloc rectangulaire de pixels dans l'ImageData
+ */
+function fillBlock(data, startX, startY, blockWidth, blockHeight, color32) {
+  if (color32 === 0) return; // Skip transparent pixels
+  
+  const endX = Math.min(startX + blockWidth, canvasWidth);
+  const endY = Math.min(startY + blockHeight, canvasHeight);
+  
+  // Extraire les composantes RGBA du color32
+  const r = color32 & 0xFF;
+  const g = (color32 >> 8) & 0xFF;
+  const b = (color32 >> 16) & 0xFF;
+  const a = (color32 >> 24) & 0xFF;
+  
+  for (let y = startY; y < endY; y++) {
+    for (let x = startX; x < endX; x++) {
+      const pixelIndex = (y * canvasWidth + x) * 4;
+      data[pixelIndex] = r;     // Rouge
+      data[pixelIndex + 1] = g; // Vert
+      data[pixelIndex + 2] = b; // Bleu
+      data[pixelIndex + 3] = a; // Alpha
     }
   }
 }
 
-function putPixel(x, y) {
-  context.fillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight);
+/**
+ * Version optimisée du rendu de la grille avec ImageData
+ */
+function drawGridOptimized() {
+  if (currentState === null) return;
+  
+  // Créer l'ImageData une seule fois
+  if (!imageData) {
+    imageData = context.createImageData(canvasWidth, canvasHeight);
+    imageDataBuffer = imageData.data;
+  }
+  
+  // Effacer l'image (plus rapide que clearRect)
+  imageDataBuffer.fill(0);
+  
+  // Rendu optimisé - redessiner toutes les particules à chaque frame
+  for (let gridY = 0; gridY < gridHeight; gridY++) {
+    for (let gridX = 0; gridX < gridWidth; gridX++) {
+      const gridIndex = gridY * gridWidth + gridX;
+      const particleId = currentState[gridIndex];
+      
+      if (particleId > 0) {
+        const pixelX = gridX * cellWidth;
+        const pixelY = gridY * cellHeight;
+        const color = materialColors[particleId];
+        fillBlock(imageDataBuffer, pixelX, pixelY, cellWidth, cellHeight, color);
+      }
+    }
+  }
+  
+  // Dessiner l'ImageData d'un coup
+  context.putImageData(imageData, 0, 0);
 }
 
-function ellipsePoints(x0, y0, x, y) {
-  putPixel(x0 + x, y0 + y);
-  putPixel(x0 - x, y0 + y);
-  putPixel(x0 + x, y0 - y);
-  putPixel(x0 - x, y0 - y);
-
-  putPixel(x0 + y, y0 + x);
-  putPixel(x0 - y, y0 + x);
-  putPixel(x0 + y, y0 - x);
-  putPixel(x0 - y, y0 - x);
+/**
+ * Version optimisée pour dessiner un pixel unique
+ */
+function putPixelOptimized(gridX, gridY, color32) {
+  if (gridX < 0 || gridX >= gridWidth || gridY < 0 || gridY >= gridHeight) return;
+  
+  const pixelX = gridX * cellWidth;
+  const pixelY = gridY * cellHeight;
+  
+  fillBlock(imageDataBuffer, pixelX, pixelY, cellWidth, cellHeight, color32);
 }
 
-function drawCircle(x0, y0, r) {
+/**
+ * Dessine les points d'une ellipse optimisée
+ */
+function ellipsePointsOptimized(x0, y0, x, y, color32) {
+  putPixelOptimized(x0 + x, y0 + y, color32);
+  putPixelOptimized(x0 - x, y0 + y, color32);
+  putPixelOptimized(x0 + x, y0 - y, color32);
+  putPixelOptimized(x0 - x, y0 - y, color32);
+  
+  putPixelOptimized(x0 + y, y0 + x, color32);
+  putPixelOptimized(x0 - y, y0 + x, color32);
+  putPixelOptimized(x0 + y, y0 - x, color32);
+  putPixelOptimized(x0 - y, y0 - x, color32);
+}
+
+/**
+ * Algorithme de cercle de Bresenham optimisé
+ */
+function drawCircleOptimized(x0, y0, r, color32) {
   let d = 5 - 4 * r;
   let x = 0;
   let y = r;
@@ -59,7 +148,7 @@ function drawCircle(x0, y0, r) {
 
   while (x <= y) {
     for (let i = y; i >= 0; i -= 1) {
-      ellipsePoints(x0, y0, x, i);
+      ellipsePointsOptimized(x0, y0, x, i, color32);
     }
 
     if (d > 0) {
@@ -77,19 +166,28 @@ function drawCircle(x0, y0, r) {
   }
 }
 
-function drawCursor() {
-  if (mouse && mouse.x !== -1) {
-    context.fillStyle = '#000000';
-    const posX = ~~(((mouse.x - left) / canvasWidth) * gridWidth);
-    const posY = ~~(((mouse.y - top) / canvasHeight) * gridHeight);
-    if (mouse.toolSize === 1) {
-      context.fillRect(posX * cellWidth, posY * cellHeight, cellWidth, cellHeight);
-    } else {
-      drawCircle(posX, posY, mouse.toolSize - 1);
-    }
+/**
+ * Rendu du curseur optimisé
+ */
+function drawCursorOptimized() {
+  if (!mouse || mouse.x === -1 || !imageData) return;
+  
+  const posX = ~~(((mouse.x - left) / canvasWidth) * gridWidth);
+  const posY = ~~(((mouse.y - top) / canvasHeight) * gridHeight);
+  
+  // Couleur noire pour le curseur (format ABGR)
+  const cursorColor = 0xFF000000; // Alpha=255, R=G=B=0
+  
+  if (mouse.toolSize === 1) {
+    putPixelOptimized(posX, posY, cursorColor);
+  } else {
+    drawCircleOptimized(posX, posY, mouse.toolSize - 1, cursorColor);
   }
 }
 
+/**
+ * Calcul des FPS optimisé
+ */
 function calculateFPS() {
   frameCount++;
   const currentTime = performance.now();
@@ -104,31 +202,59 @@ function calculateFPS() {
   }
 }
 
+/**
+ * Met à jour les informations de la souris
+ */
 function setMouse(_mouse) {
   mouse = _mouse;
 }
 
+/**
+ * Boucle d'animation optimisée
+ */
 function animate() {
-  drawGrid();
-  drawCursor();
+  // Rendu de la grille optimisé
+  drawGridOptimized();
+  
+  // Rendu du curseur optimisé
+  drawCursorOptimized();
+  
+  // Puis appliquer l'ImageData finale
+  if (imageData && mouse && mouse.x !== -1) {
+    context.putImageData(imageData, 0, 0);
+  }
+  
+  // Calcul des FPS
   calculateFPS();
+  
+  // Continuer l'animation
   requestAnimationFrame(animate);
 }
 
+/**
+ * Met à jour l'état actuel de la simulation
+ */
 function setCurrentState(_currentState) {
   currentState = _currentState;
 }
 
+/**
+ * Gestionnaire des messages du canal de communication
+ */
 function onChannelMessage({ data }) {
   const [inst, ...argz] = data;
   switch (inst) {
     case 'setCurrentState':
       setCurrentState(...argz);
       break;
-    default: break;
+    default: 
+      break;
   }
 }
 
+/**
+ * Initialisation du worker avec optimisations
+ */
 function initialize(_cellWidth, _cellHeight, _canvasWidth, _canvasHeight, _gridWidth, _gridHeight, _canvas, _materials, _messageChannel, _top, _left) {
   cellWidth = _cellWidth;
   cellHeight = _cellHeight;
@@ -139,13 +265,32 @@ function initialize(_cellWidth, _cellHeight, _canvasWidth, _canvasHeight, _gridW
   canvas = _canvas;
   materials = _materials;
   messageChannel = _messageChannel;
-
-  context = canvas.getContext('2d');
   top = _top;
   left = _left;
+
+  // Initialiser le contexte
+  context = canvas.getContext('2d');
+  
+  // Optimisations du contexte
+  context.imageSmoothingEnabled = false;
+  context.webkitImageSmoothingEnabled = false;
+  context.mozImageSmoothingEnabled = false;
+  
+  // Pré-calculer les couleurs des matériaux
+  precomputeMaterialColors();
+  
+  // Configurer le canal de communication
   messageChannel.onmessage = onChannelMessage;
+  
+  console.log('Painter worker initialized with ImageData optimization');
+  console.log(`Grid: ${gridWidth}x${gridHeight}, Canvas: ${canvasWidth}x${canvasHeight}`);
+  console.log(`Cell size: ${cellWidth}x${cellHeight}`);
+  console.log(`Materials precomputed: ${materialColors.length}`);
 }
 
+/**
+ * Gestionnaire principal des messages
+ */
 onmessage = ({ data }) => {
   const [inst, ...argz] = data;
 
@@ -159,6 +304,7 @@ onmessage = ({ data }) => {
     case 'animate':
       animate();
       break;
-    default: break;
+    default: 
+      break;
   }
 };
