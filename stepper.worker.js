@@ -5,10 +5,9 @@ let currentState = null;
 let nextState = null;
 let messageChannel = null;
 
-const particleCount = {
-  water: 0,
-  sand: 0,
-};
+const particleCount = {};
+
+let speedMultiplier = 1;
 
 function initialize(_gridWidth, _gridHeight, _materials, _messageChannel) {
   gridWidth = _gridWidth;
@@ -18,6 +17,11 @@ function initialize(_gridWidth, _gridHeight, _materials, _messageChannel) {
   nextState = new Uint16Array(gridWidth * gridHeight);
   messageChannel = _messageChannel;
   currentState.fill(0);
+
+  const materialsArray = [...new Set([...materials].map((e) => e[1].name))].filter((e) => e !== 'void');
+  for (let i = 0; i < materialsArray.length; i++) {
+    particleCount[materialsArray[i]] = 0;
+  }
 }
 
 function xyToI(x, y) {
@@ -75,7 +79,7 @@ function getNeighborCells(i) {
   };
 }
 
-function doStepWater(i5, s5) {
+function doStepLiquid(i5, s5) {
   const {
     s1, s2, s3, s4, s6, i1, i2, i3, i4, i6, s7, s9,
   } = getNeighborCells(i5);
@@ -121,7 +125,7 @@ function doStepWater(i5, s5) {
   nextState[i5] = s5;
 }
 
-function doStepSand(i5, s5) {
+function doStepSolid(i5, s5) {
   const {
     s1, s2, s3, i1, i2, i3, s4, s6,
   } = getNeighborCells(i5);
@@ -176,17 +180,24 @@ function doStep() {
   nextState.fill(0);
   Object.keys(particleCount).forEach((key) => { particleCount[key] = 0; });
   for (let y = 0; y < gridHeight; y += 1) {
-    for (let x = 0; x < gridWidth; x += 1) {
+    const startX = y % 2 === 0 ? 0 : gridWidth - 1;
+    const endX = y % 2 === 0 ? gridWidth : -1;
+    const stepX = y % 2 === 0 ? 1 : -1;
+
+    for (let x = startX; x !== endX; x += stepX) {
       const i5 = xyToI(x, y);
       const s5 = currentState[i5];
-      const { name: materialName } = materials.get(s5);
+      const { name: materialName, type } = materials.get(s5);
       particleCount[materialName] += 1;
-      switch (materialName) {
-        case 'sand': doStepSand(i5, s5);
+      switch (type) {
+        case 'solid':
+          doStepSolid(i5, s5);
           break;
-        case 'water': doStepWater(i5, s5);
+        case 'liquid':
+          doStepLiquid(i5, s5);
           break;
-        default: break;
+        default:
+          break;
       }
     }
   }

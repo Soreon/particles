@@ -2,8 +2,14 @@
 /* eslint-disable no-unused-vars */
 import materials from './materials.js';
 
-const canvas = document.getElementById('canvas').transferControlToOffscreen();
-const { top, left } = document.getElementById('canvas').getBoundingClientRect();
+const canvasElement = document.getElementById('canvas');
+const toolElement = document.getElementById('tool');
+const debugElement = document.getElementById('debug');
+const fpsElement = document.getElementById('fps-value');
+const countElements = [];
+
+const canvas = canvasElement.transferControlToOffscreen();
+const { top, left } = canvasElement.getBoundingClientRect();
 
 const painterWorker = new Worker('painter.worker.js');
 const stepperWorker = new Worker('stepper.worker.js');
@@ -18,7 +24,7 @@ const gridHeight = 160;
 const cellWidth = ~~(canvasWidth / gridWidth);
 const cellHeight = ~~(canvasHeight / gridHeight);
 
-const tools = ['void', 'water', 'sand'];
+const tools = ['void', 'water', 'sand', 'oil', 'alcool'];
 const mouse = {
   x: 0,
   y: 0,
@@ -28,11 +34,10 @@ const mouse = {
 };
 
 const debugData = {
-  count: {
-    water: 0,
-    sand: 0,
-  },
+  count: {},
 };
+
+const materialsArray = [...new Set([...materials].map((e) => e[1].name))].filter((e) => e !== 'void');
 
 function getRandomIntInclusive(_min, _max) {
   const min = Math.ceil(_min);
@@ -58,13 +63,40 @@ function getRandomMaterial(array) {
   return getRandomIntInclusive(min, max);
 }
 
+function initializeDebugElements() {
+  // <div class="debugRow"><span class="debugLabel">Water: </span><span id="waterCount" class="debugValue"></span></div>
+  for (let i = 0; i < materialsArray.length; i++) {
+    const debugRow = debugElement.appendChild(document.createElement('div'));
+    debugRow.classList.add('debugRow');
+
+    const debugLabel = debugRow.appendChild(document.createElement('span'));
+    debugLabel.classList.add('debugLabel');
+    const name = materialsArray[i] + ': ';
+    debugLabel.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+
+    const debugValue = debugRow.appendChild(document.createElement('span'));
+    debugValue.classList.add('debugValue');
+    debugValue.id = materialsArray[i] + 'Count';
+    countElements[i] = debugValue;
+
+    debugData.count[materialsArray[i]] = 0;
+  }
+}
+
 function displayDebug() {
-  document.getElementById('waterCount').textContent = debugData.count.water;
-  document.getElementById('sandCount').textContent = debugData.count.sand;
-  document.getElementById('tool').textContent = mouse.tool;
+  for (let i = 0; i < materialsArray.length; i++) {
+    countElements.find((e) => e.id === materialsArray[i] + 'Count').textContent = debugData.count[materialsArray[i]];
+  }
+  toolElement.textContent = mouse.tool;
+}
+
+function updateFPS(fps) {
+  fpsElement.textContent = Math.round(fps);
 }
 
 function initialize() {
+  initializeDebugElements();
+
   stepperWorker.postMessage(['initialize', gridWidth, gridHeight, materials, messageChannel.port1], [messageChannel.port1]);
   stepperWorker.postMessage(['process']);
 
@@ -72,10 +104,10 @@ function initialize() {
   painterWorker.postMessage(['animate']);
 }
 
-function setCellAtPixelPosition(x, y, v) {
+function setCellAtPixelPosition(x, y) {
   const posX = ~~(((x - left) / canvasWidth) * gridWidth);
   const posY = ~~(((y - top) / canvasHeight) * gridHeight);
-  const matIds = getMaterialIds(v);
+  const matIds = getMaterialIds(mouse.tool);
   const matId = matIds[~~(Math.random() * matIds.length)];
   stepperWorker.postMessage(['setCell', posX, posY, matId]);
 }
@@ -84,17 +116,17 @@ function setDebugData(particleCount) {
   debugData.count = particleCount;
 }
 
-document.getElementById('canvas').addEventListener('mousedown', () => { mouse.dragging = true; });
-document.getElementById('canvas').addEventListener('mouseup', () => { mouse.dragging = false; });
-document.getElementById('canvas').addEventListener('mousemove', (e) => {
+canvasElement.addEventListener('mousedown', () => { mouse.dragging = true; });
+canvasElement.addEventListener('mouseup', () => { mouse.dragging = false; });
+canvasElement.addEventListener('mousemove', (e) => {
   mouse.x = e.clientX;
   mouse.y = e.clientY;
 });
-document.getElementById('canvas').addEventListener('mouseleave', (e) => {
+canvasElement.addEventListener('mouseleave', (e) => {
   mouse.x = -1;
   mouse.y = -1;
 });
-document.getElementById('canvas').addEventListener('wheel', (e) => {
+canvasElement.addEventListener('wheel', (e) => {
   if (e.ctrlKey) {
     e.preventDefault();
     if (e.deltaY > 0) {
@@ -118,17 +150,23 @@ document.getElementById('canvas').addEventListener('wheel', (e) => {
 });
 
 function ellipsePoints(x0, y0, x, y) {
-  setCellAtPixelPosition(x0 + x, y0 + y, mouse.tool);
-  setCellAtPixelPosition(x0 - x, y0 + y, mouse.tool);
-  setCellAtPixelPosition(x0 + x, y0 - y, mouse.tool);
-  setCellAtPixelPosition(x0 - x, y0 - y, mouse.tool);
-  setCellAtPixelPosition(x0 + y, y0 + x, mouse.tool);
-  setCellAtPixelPosition(x0 - y, y0 + x, mouse.tool);
-  setCellAtPixelPosition(x0 + y, y0 - x, mouse.tool);
-  setCellAtPixelPosition(x0 - y, y0 - x, mouse.tool);
+  setCellAtPixelPosition(x0 + x, y0 + y);
+  setCellAtPixelPosition(x0 - x, y0 + y);
+  setCellAtPixelPosition(x0 + x, y0 - y);
+  setCellAtPixelPosition(x0 - x, y0 - y);
+  setCellAtPixelPosition(x0 + y, y0 + x);
+  setCellAtPixelPosition(x0 - y, y0 + x);
+  setCellAtPixelPosition(x0 + y, y0 - x);
+  setCellAtPixelPosition(x0 - y, y0 - x);
 }
 
-function setCellsAtPixelPosition(x0, y0, r) {
+function setCellsAtPixelPosition(x0, y0) {
+  if (mouse.toolSize === 1) {
+    setCellAtPixelPosition(x0, y0);
+    return;
+  }
+
+  const r = mouse.toolSize + 1;
   let d = 5 - 4 * r;
   let x = 0;
   let y = r;
@@ -158,15 +196,12 @@ function setCellsAtPixelPosition(x0, y0, r) {
 initialize();
 
 setInterval(() => {
-  if (mouse.dragging) {
-    if (mouse.toolSize === 1) {
-      setCellAtPixelPosition(mouse.x, mouse.y, mouse.tool);
-    } else {
-      setCellsAtPixelPosition(mouse.x, mouse.y, mouse.toolSize + 1, mouse.tool);
-    }
-  }
   painterWorker.postMessage(['setMouse', mouse]);
   displayDebug();
+
+  if (!mouse.dragging) return;
+
+  setCellsAtPixelPosition(mouse.x, mouse.y);
 }, 10);
 
 stepperWorker.onmessage = ({ data }) => {
@@ -175,6 +210,17 @@ stepperWorker.onmessage = ({ data }) => {
   switch (inst) {
     case 'setDebugData':
       setDebugData(...argz);
+      break;
+    default: break;
+  }
+};
+
+painterWorker.onmessage = ({ data }) => {
+  const [inst, ...argz] = data;
+
+  switch (inst) {
+    case 'fps':
+      updateFPS(...argz);
       break;
     default: break;
   }

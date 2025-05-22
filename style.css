@@ -9,6 +9,7 @@ canvas {
     image-rendering: pixelated;
     image-rendering: crisp-edges;
     cursor: none;
+    border: 1px solid #EEE;
 }
 
 body {
@@ -46,4 +47,24 @@ body {
 
 .debugValue {
   flex: 1;
+}
+
+#fps-counter {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  font-family: pixel;
+  font-size: 8px;
+  color: #666;
+  background-color: rgba(255, 255, 255, 0.8);
+  padding: 2px 6px;
+  border-radius: 3px;
+  user-select: none;
+  z-index: 1000;
+  opacity: 0.7;
+  transition: opacity 0.2s ease;
+}
+
+#fps-counter:hover {
+  opacity: 1;
 }

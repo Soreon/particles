@@ -15,6 +15,11 @@ let materials = null;
 let messageChannel = null;
 let mouse = null;
 
+// Variables pour le calcul des FPS
+let frameCount = 0;
+let lastTime = performance.now();
+let fps = 0;
+
 function drawGrid() {
   if (currentState === null) return;
   context.clearRect(0, 0, canvasWidth, canvasHeight);
@@ -28,6 +33,7 @@ function drawGrid() {
     }
   }
 }
+
 function putPixel(x, y) {
   context.fillRect(x * cellWidth, y * cellHeight, cellWidth, cellHeight);
 }
@@ -43,6 +49,7 @@ function ellipsePoints(x0, y0, x, y) {
   putPixel(x0 + y, y0 - x);
   putPixel(x0 - y, y0 - x);
 }
+
 function drawCircle(x0, y0, r) {
   let d = 5 - 4 * r;
   let x = 0;
@@ -83,6 +90,20 @@ function drawCursor() {
   }
 }
 
+function calculateFPS() {
+  frameCount++;
+  const currentTime = performance.now();
+  
+  if (currentTime - lastTime >= 1000) {
+    fps = frameCount;
+    frameCount = 0;
+    lastTime = currentTime;
+    
+    // Envoyer les FPS au thread principal
+    postMessage(['fps', fps]);
+  }
+}
+
 function setMouse(_mouse) {
   mouse = _mouse;
 }
@@ -90,6 +111,7 @@ function setMouse(_mouse) {
 function animate() {
   drawGrid();
   drawCursor();
+  calculateFPS();
   requestAnimationFrame(animate);
 }
 
