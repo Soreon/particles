@@ -1,227 +1,146 @@
 /* eslint-disable no-bitwise */
-/* eslint-disable no-unused-vars */
+//
+// main.js — Thread principal.
+//
+// Ne fait quasiment rien côté calcul : il transfère l'OffscreenCanvas au worker
+// GPU, construit les tables de lookup (palette de couleurs + propriétés des
+// matériaux) à partir de materials.js, et relaie les entrées souris/molette.
+// Toute la simulation et le rendu vivent dans gpu.worker.js (WebGL2).
+
 import materials from './materials.js';
 
 const canvasElement = document.getElementById('canvas');
 const toolElement = document.getElementById('tool');
-const debugElement = document.getElementById('debug');
 const fpsElement = document.getElementById('fps-value');
-const countElements = [];
-
-const canvas = canvasElement.transferControlToOffscreen();
-const { top, left } = canvasElement.getBoundingClientRect();
-
-const painterWorker = new Worker('painter.worker.js');
-const stepperWorker = new Worker('stepper.worker.js');
-const messageChannel = new MessageChannel();
-
-const canvasWidth = 800;
-const canvasHeight = 800;
 
 const gridWidth = 160;
 const gridHeight = 160;
 
-const cellWidth = ~~(canvasWidth / gridWidth);
-const cellHeight = ~~(canvasHeight / gridHeight);
-
 const tools = ['void', 'water', 'sand', 'oil', 'alcool'];
+
 const mouse = {
   x: 0,
   y: 0,
+  gridX: -1,
+  gridY: -1,
   dragging: false,
-  tool: 'void',
-  toolSize: 1,
+  tool: 'sand',
+  toolSize: 3,
 };
 
-const debugData = {
-  count: {},
-};
+// --- Construction des tables de lookup (indexées par id de matériau, 0..255) ---
 
-const materialsArray = [...new Set([...materials].map((e) => e[1].name))].filter((e) => e !== 'void');
+const TYPE_VOID = 0;
+const TYPE_SOLID = 1;
+const TYPE_LIQUID = 2;
 
-function getRandomIntInclusive(_min, _max) {
-  const min = Math.ceil(_min);
-  const max = ~~(_max);
-  return ~~(Math.random() * (max - min + 1) + min);
-}
+function buildLookupTables() {
+  const palette = new Uint8Array(256 * 4); // RGBA par id
+  const props = new Uint8Array(256 * 4);   // [densité, type, _, _] par id
 
-function getMaterialIds(material) {
-  return [...materials].filter((e) => e[1].name === material).map((e) => e[0]);
-}
-
-function getRandomMaterial(array) {
-  let min = Infinity;
-  let max = -Infinity;
-
-  materials.forEach((e, k) => {
-    if (array.includes(e.name)) {
-      min = Math.min(min, k);
-      max = Math.max(max, k);
+  materials.forEach((mat, id) => {
+    if (mat.color) {
+      const hex = mat.color.slice(1);
+      palette[id * 4 + 0] = parseInt(hex.slice(0, 2), 16);
+      palette[id * 4 + 1] = parseInt(hex.slice(2, 4), 16);
+      palette[id * 4 + 2] = parseInt(hex.slice(4, 6), 16);
+      palette[id * 4 + 3] = 255;
     }
+    props[id * 4 + 0] = mat.density || 0;
+    if (mat.type === 'solid') props[id * 4 + 1] = TYPE_SOLID;
+    else if (mat.type === 'liquid') props[id * 4 + 1] = TYPE_LIQUID;
+    else props[id * 4 + 1] = TYPE_VOID;
   });
 
-  return getRandomIntInclusive(min, max);
+  return { palette, props };
 }
 
-function initializeDebugElements() {
-  // <div class="debugRow"><span class="debugLabel">Water: </span><span id="waterCount" class="debugValue"></span></div>
-  for (let i = 0; i < materialsArray.length; i++) {
-    const debugRow = debugElement.appendChild(document.createElement('div'));
-    debugRow.classList.add('debugRow');
-
-    const debugLabel = debugRow.appendChild(document.createElement('span'));
-    debugLabel.classList.add('debugLabel');
-    const name = materialsArray[i] + ': ';
-    debugLabel.textContent = name.charAt(0).toUpperCase() + name.slice(1);
-
-    const debugValue = debugRow.appendChild(document.createElement('span'));
-    debugValue.classList.add('debugValue');
-    debugValue.id = materialsArray[i] + 'Count';
-    countElements[i] = debugValue;
-
-    debugData.count[materialsArray[i]] = 0;
-  }
+// tool (nom) -> liste d'ids candidats (variantes de couleur)
+function buildToolIds() {
+  const map = { void: [0] };
+  materials.forEach((mat, id) => {
+    if (!mat.name || mat.name === 'void') return;
+    if (!map[mat.name]) map[mat.name] = [];
+    map[mat.name].push(id);
+  });
+  return map;
 }
 
-function displayDebug() {
-  for (let i = 0; i < materialsArray.length; i++) {
-    countElements.find((e) => e.id === materialsArray[i] + 'Count').textContent = debugData.count[materialsArray[i]];
-  }
-  toolElement.textContent = mouse.tool;
+// --- Démarrage ---
+
+const { palette, props } = buildLookupTables();
+const toolIds = buildToolIds();
+
+const rect = canvasElement.getBoundingClientRect();
+const displayLeft = rect.left;
+const displayTop = rect.top;
+const displayWidth = rect.width;
+const displayHeight = rect.height;
+
+const offscreen = canvasElement.transferControlToOffscreen();
+const gpuWorker = new Worker('gpu.worker.js');
+
+gpuWorker.postMessage(['initialize', {
+  canvas: offscreen,
+  gridWidth,
+  gridHeight,
+  palette,
+  props,
+  toolIds,
+}], [offscreen, palette.buffer, props.buffer]);
+
+toolElement.textContent = mouse.tool;
+
+// --- Conversion coordonnées écran -> cases de la grille ---
+
+function updateGridPosition() {
+  mouse.gridX = ~~(((mouse.x - displayLeft) / displayWidth) * gridWidth);
+  mouse.gridY = ~~(((mouse.y - displayTop) / displayHeight) * gridHeight);
 }
 
-function updateFPS(fps) {
-  fpsElement.textContent = Math.round(fps);
-}
-
-function initialize() {
-  initializeDebugElements();
-
-  stepperWorker.postMessage(['initialize', gridWidth, gridHeight, materials, messageChannel.port1], [messageChannel.port1]);
-  stepperWorker.postMessage(['process']);
-
-  painterWorker.postMessage(['initialize', cellWidth, cellHeight, canvasWidth, canvasHeight, gridWidth, gridHeight, canvas, materials, messageChannel.port2, top, left], [canvas, messageChannel.port2]);
-  painterWorker.postMessage(['animate']);
-}
-
-function setCellAtPixelPosition(x, y) {
-  const posX = ~~(((x - left) / canvasWidth) * gridWidth);
-  const posY = ~~(((y - top) / canvasHeight) * gridHeight);
-  const matIds = getMaterialIds(mouse.tool);
-  const matId = matIds[~~(Math.random() * matIds.length)];
-  stepperWorker.postMessage(['setCell', posX, posY, matId]);
-}
-
-function setDebugData(particleCount) {
-  debugData.count = particleCount;
-}
+// --- Entrées ---
 
 canvasElement.addEventListener('mousedown', () => { mouse.dragging = true; });
 canvasElement.addEventListener('mouseup', () => { mouse.dragging = false; });
 canvasElement.addEventListener('mousemove', (e) => {
   mouse.x = e.clientX;
   mouse.y = e.clientY;
+  updateGridPosition();
 });
-canvasElement.addEventListener('mouseleave', (e) => {
-  mouse.x = -1;
-  mouse.y = -1;
+canvasElement.addEventListener('mouseleave', () => {
+  mouse.gridX = -1;
+  mouse.gridY = -1;
 });
 canvasElement.addEventListener('wheel', (e) => {
   if (e.ctrlKey) {
     e.preventDefault();
-    if (e.deltaY > 0) {
-      mouse.toolSize -= 1;
-    } else {
-      mouse.toolSize += 1;
-    }
-    mouse.toolSize = Math.max(mouse.toolSize, 1);
-    mouse.toolSize = Math.min(mouse.toolSize, 5);
+    mouse.toolSize += e.deltaY > 0 ? -1 : 1;
+    mouse.toolSize = Math.max(1, Math.min(5, mouse.toolSize));
   } else {
-    let index = tools.indexOf(mouse.tool);
-    if (e.deltaY > 0) {
-      index += 1;
-    } else {
-      index -= 1;
-    }
-    index += tools.length;
-    index %= tools.length;
+    let index = tools.indexOf(mouse.tool) + (e.deltaY > 0 ? 1 : -1);
+    index = (index + tools.length) % tools.length;
     mouse.tool = tools[index];
+    toolElement.textContent = mouse.tool;
   }
-});
+}, { passive: false });
 
-function ellipsePoints(x0, y0, x, y) {
-  setCellAtPixelPosition(x0 + x, y0 + y);
-  setCellAtPixelPosition(x0 - x, y0 + y);
-  setCellAtPixelPosition(x0 + x, y0 - y);
-  setCellAtPixelPosition(x0 - x, y0 - y);
-  setCellAtPixelPosition(x0 + y, y0 + x);
-  setCellAtPixelPosition(x0 - y, y0 + x);
-  setCellAtPixelPosition(x0 + y, y0 - x);
-  setCellAtPixelPosition(x0 - y, y0 - x);
-}
-
-function setCellsAtPixelPosition(x0, y0) {
-  if (mouse.toolSize === 1) {
-    setCellAtPixelPosition(x0, y0);
-    return;
-  }
-
-  const r = mouse.toolSize + 1;
-  let d = 5 - 4 * r;
-  let x = 0;
-  let y = r;
-  let deltaA = (-2 * r + 5) * 4;
-  let deltaB = 3 * 4;
-
-  while (x <= y) {
-    for (let i = y; i >= 0; i -= 1) {
-      ellipsePoints(x0, y0, x, i);
-    }
-
-    if (d > 0) {
-      d += deltaA;
-      y -= 1;
-      x += 1;
-      deltaA += 4 * 4;
-      deltaB += 2 * 2;
-    } else {
-      d += deltaB;
-      x += 1;
-      deltaA += 2 * 4;
-      deltaB += 2 * 4;
-    }
-  }
-}
-
-initialize();
-
+// Boucle d'entrée : envoie l'état souris (pour le curseur) et peint si on drague.
 setInterval(() => {
-  painterWorker.postMessage(['setMouse', mouse]);
-  displayDebug();
-
-  if (!mouse.dragging) return;
-
-  setCellsAtPixelPosition(mouse.x, mouse.y);
+  gpuWorker.postMessage(['mouse', mouse.gridX, mouse.gridY, mouse.toolSize, mouse.dragging]);
+  if (mouse.dragging && mouse.gridX >= 0) {
+    gpuWorker.postMessage(['paint', mouse.gridX, mouse.gridY, mouse.toolSize, mouse.tool]);
+  }
 }, 10);
 
-stepperWorker.onmessage = ({ data }) => {
-  const [inst, ...argz] = data;
+// --- Retours du worker ---
 
-  switch (inst) {
-    case 'setDebugData':
-      setDebugData(...argz);
-      break;
-    default: break;
-  }
-};
-
-painterWorker.onmessage = ({ data }) => {
-  const [inst, ...argz] = data;
-
+gpuWorker.onmessage = ({ data }) => {
+  const [inst, ...args] = data;
   switch (inst) {
     case 'fps':
-      updateFPS(...argz);
+      fpsElement.textContent = Math.round(args[0]);
       break;
-    default: break;
+    default:
+      break;
   }
 };
