@@ -12,7 +12,7 @@
 //     leur fluidité, vitesse terminale par fluidité du porteur, friction vx
 //     double pour les visqueux.
 
-const { DENS, TYPE, FLUID, T_LIQUID } = require('../materials');
+const { DENS, TYPE, FLUID, T_LIQUID, T_GAS } = require('../materials');
 
 const K = 2;  // portée du scan de dénivelé (exact : la décision sature à 2)
 const KS = 3; // portée du scan posé / en-transit
@@ -22,10 +22,14 @@ module.exports = function v10(ctx) {
     L, R, dL, dR, lLiq, rLiq, lp, rp, blockedBelow, openAbove, densAt, idAt, rnd, rnd2,
   } = ctx;
 
-  // A. Nivellement de surface (liquide <-> vide), gaté par la fluidité du mouvant.
-  if (lLiq && R === 0 && blockedBelow(lp) && openAbove(rp)
+  // A. Nivellement de surface (liquide <-> vide OU GAZ : un rideau de vapeur
+  // ne fait pas barrage à l'eau — elle le déplace, il remonte), gaté par la
+  // fluidité du mouvant.
+  const passR = R === 0 || TYPE[R] === T_GAS;
+  const passL = L === 0 || TYPE[L] === T_GAS;
+  if (lLiq && passR && blockedBelow(lp) && openAbove(rp)
       && (openAbove(lp) || blockedBelow(rp))) return rnd2 < FLUID[L] / 255;
-  if (rLiq && L === 0 && blockedBelow(rp) && openAbove(lp)
+  if (rLiq && passL && blockedBelow(rp) && openAbove(lp)
       && (openAbove(rp) || blockedBelow(lp))) return rnd2 < FLUID[R] / 255;
 
   if (!(lLiq && rLiq)) return false;

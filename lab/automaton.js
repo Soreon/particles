@@ -15,6 +15,47 @@ function movable(id) {
   return t !== T_STATIC && t !== T_FIRE;
 }
 
+// --- Moteur thermique (v12) ---
+const AMBIENT = 32;
+// Conductivité par matériau (en /64 par paire de voisins, max sûr ~12 :
+// la somme des 4 paires doit rester < 64 pour une diffusion stable).
+const COND = new Uint8Array(256).fill(6);
+COND[0] = 1; // l'AIR est un vrai isolant (k=1) : la chaleur y voyage par
+             // CONVECTION (les panaches montent sans saigner latéralement)
+function setCond(idStart, k) { for (let i = idStart; i < idStart + 10; i++) COND[i] = k; }
+setCond(100, 3);  // sable
+setCond(110, 8);  // eau (bonne conductrice : refroidit vite la lave)
+setCond(120, 5);  // huile
+setCond(130, 6);  // alcool
+setCond(140, 5);  // pierre (conduit assez pour faire bouillir au travers de la croûte)
+setCond(150, 2);  // bois (isolant)
+setCond(160, 8);  // feu (rayonne fort)
+setCond(170, 6);  // fumée
+setCond(180, 6);  // vapeur
+setCond(190, 5);  // lave
+setCond(200, 8);  // glace (mord fort : la banquise gagne contre la rechauffe)
+setCond(210, 3);  // plante
+setCond(220, 3);  // poudre
+// Convection : bonus de conductivité VERTICALE quand la cellule du dessous
+// est de l'air/du gaz plus chaud (les panaches montent).
+const CONV_BONUS = 24;
+// Capacité thermique (décalage) : 1 = chauffe/refroidit 2x plus lentement à
+// flux égal — l'eau est un énorme tampon (elle refroidit la lave AVANT de
+// bouillir), sans quoi elle flashe en vapeur avant que la croûte ne prenne.
+const HEATCAP = new Uint8Array(256);
+for (let i = 110; i <= 119; i++) HEATCAP[i] = 1; // eau
+for (let i = 200; i <= 209; i++) HEATCAP[i] = 1; // glace
+for (let i = 170; i <= 189; i++) HEATCAP[i] = 3; // gaz : adiabatiques en plein air (refroidissent par CONTACT froid : plafonds, murs, sommet du monde)
+// Température initiale à la pose (pinceau / scénarios).
+function initTemp(id) {
+  if (id >= 190 && id <= 199) return 255; // lave
+  if (TYPE[id] === T_FIRE) return 220;
+  if (id >= 200 && id <= 209) return 4;   // glace (réservoir de froid)
+  if (id >= 170 && id <= 179) return 180;  // fumée (née très chaude : longue montée)
+  if (id >= 180 && id <= 189) return 170;  // vapeur (chaleur latente embarquée)
+  return AMBIENT;
+}
+
 // Hash déterministe -> [0,1) (équivalent du hash() des shaders).
 function hash01(x, y, salt) {
   let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(salt, 2246822519)) | 0;
@@ -48,6 +89,7 @@ class Sim {
     this.engineVelocity = !!eng.velocity;
     this.engineViscosity = !!eng.viscosity;
     this.engineTransforms = !!eng.transforms;
+    this.engineHeat = !!eng.heat;
     this.G = eng.G || 1;
     this.jitterP = eng.jitterP || 0;
     this.grid = new Uint8Array(w * h);
@@ -62,6 +104,7 @@ class Sim {
     this.vxN = new Uint8Array(w * h);
     this.fl = new Uint8Array(w * h);
     this.flN = new Uint8Array(w * h);
+    if (this.engineHeat) this.fl.fill(AMBIENT); // le monde démarre à l''ambiant
     this.substepCounter = 0;
     this.flowCounter = 0;
     this.substepsPerFrame = 8;
@@ -214,7 +257,7 @@ class Sim {
         }
         return true;
       }
-      vy[i] = 0x80 | 2; // poussée d'Archimède permanente
+      vy[i] = 0x80 | Math.max(3, this.substepsPerFrame >> 2); // poussée d'Archimède (proportionnelle à la résolution)
       if (r1 < 0.3) vx[i] = (r2 < 0.5 ? 0x80 : 0) | 1; // wobble du panache
       return true;
     }
@@ -283,6 +326,225 @@ class Sim {
     return false;
   }
 
+  // Passe thermique + transformations (v12) pour UNE cellule, sur l'état
+  // pré-frame. Diffusion entière stable (somme des 4 paires < 64/64), avec
+  // convection : la conductivité verticale est dopée quand la cellule du
+  // dessous est de l'air/du gaz plus chaud. Renvoie true si la cellule est
+  // entièrement gérée (air, feu, gaz, transformée).
+  transformCellHeat(i, x, y, salt) {
+    const { w, h, grid, next, vy, vx, vxN, fl, flN } = this;
+    const id = next[i]; // état pré-frame
+    const type = TYPE[id];
+    const r1 = hash01(x, y, salt ^ 0x51f15e0d);
+    const r2 = hash01(x, y, salt ^ 0x3c6ef372);
+    const variant = (r2 * 10) | 0;
+
+    const idUp = y > 0 ? next[i - w] : 0;
+    const idDn = y + 1 < h ? next[i + w] : 0;
+    const idLf = x > 0 ? next[i - 1] : 0;
+    const idRt = x + 1 < w ? next[i + 1] : 0;
+    const tUp = y > 0 ? flN[i - w] : AMBIENT;
+    const tDn = y + 1 < h ? flN[i + w] : AMBIENT;
+    const tLf = x > 0 ? flN[i - 1] : AMBIENT;
+    const tRt = x + 1 < w ? flN[i + 1] : AMBIENT;
+
+    // --- 1. Diffusion (les bords du monde sont à l'ambiant) ---
+    const myK = COND[id];
+    let T = flN[i];
+    // Le bonus convectif ne concerne que l'AIR PUR : les gaz (fumée, vapeur)
+    // transportent leur chaleur en SE DÉPLAÇANT, pas en super-conduisant —
+    // sinon un panache de fumée se vide de sa chaleur en quelques frames.
+    let kUp = Math.min(myK, COND[idUp]);
+    let kDn = Math.min(myK, COND[idDn]);
+    if (idDn === 0 && tDn > T) kDn += CONV_BONUS; // je reçois le panache d'en bas
+    if (id === 0 && T > tUp) kUp += CONV_BONUS;   // je suis l'air chaud qui donne
+    let kLf = Math.min(myK, COND[idLf]);
+    let kRt = Math.min(myK, COND[idRt]);
+    // Conduction gaz<->liquide FAIBLE : une goutte qui retombe à travers un
+    // panache de vapeur chaude ne doit pas re-bouillir en vol (sinon boucle
+    // bouillir/condenser = blizzard churné dans le nuage).
+    const gl = (a2, b2) => (TYPE[a2] === T_GAS && TYPE[b2] === T_LIQUID) || (TYPE[a2] === T_LIQUID && TYPE[b2] === T_GAS);
+    if (gl(id, idUp)) kUp = Math.min(kUp, 2);
+    if (gl(id, idDn)) kDn = Math.min(kDn, 2);
+    if (gl(id, idLf)) kLf = Math.min(kLf, 2);
+    if (gl(id, idRt)) kRt = Math.min(kRt, 2);
+    const acc = (tUp - T) * kUp + (tDn - T) * kDn + (tLf - T) * kLf + (tRt - T) * kRt;
+    const capSh = 6 + HEATCAP[id];
+    const dither = (hash01(x, y, salt ^ 0x7ed55d16) * (1 << capSh)) | 0;
+    T += (acc + dither) >> capSh;
+    if (id >= 190 && id <= 199) T += (255 - T) >> 4; // masse thermique de la lave
+    if (id === 0) T += (AMBIENT - T) >> 6; // l'air dissipe doucement vers l'ambiant
+    if (T < 0) T = 0;
+    if (T > 255) T = 255;
+
+    const isWater = (v) => v >= 110 && v <= 119;
+    const isLava = (v) => v >= 190 && v <= 199;
+    const isIce = (v) => v >= 200 && v <= 209;
+    const isPlant = (v) => v >= 210 && v <= 219;
+    const isPowder = (v) => v >= 220 && v <= 229;
+    // souffle : feu d'explosion (bit 7 du combustible, désormais dans vx)
+    const blastAt = (j, v) => TYPE[v] === T_FIRE && (vxN[j] & 0x80) !== 0;
+
+    // --- 2. Air : porte la température, fait naître les langues de flammes ---
+    if (id === 0) {
+      fl[i] = T;
+      if (TYPE[idDn] === T_FIRE || isLava(idDn)) {
+        const pFlame = isLava(idDn) ? 0.04 : 0.12;
+        const pSmoke = isLava(idDn) ? 0.06 : 0.16;
+        if (r1 < pFlame) {
+          grid[i] = 160 + variant;
+          vx[i] = 4 + ((r2 * 5) | 0); // langue : combustible bref
+          fl[i] = 220; vy[i] = 0;
+          return true;
+        }
+        if (r1 < pSmoke) {
+          grid[i] = 170 + variant;
+          fl[i] = 140; vy[i] = 0; vx[i] = 0; // fumée née chaude
+          return true;
+        }
+      }
+      vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    const nearWater = isWater(idUp) || isWater(idDn) || isWater(idLf) || isWater(idRt);
+    const nearBlast = (y > 0 && blastAt(i - w, idUp)) || (y + 1 < h && blastAt(i + w, idDn))
+      || (x > 0 && blastAt(i - 1, idLf)) || (x + 1 < w && blastAt(i + 1, idRt));
+
+    // --- 3. Feu : SOURCE de chaleur (T=220), combustible dans vx, immobile ---
+    if (type === T_FIRE) {
+      const blastBit = vx[i] & 0x80;
+      let fuel = vx[i] & 0x7F;
+      if (fuel === 0) fuel = 25 + ((r2 * 30) | 0); // allumage frais (pinceau)
+      if (nearWater && r1 < 0.6) {
+        grid[i] = 170 + variant; fl[i] = 140; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      fuel--;
+      if (fuel <= 1) {
+        grid[i] = r1 < 0.75 ? 0 : 170 + variant;
+        fl[i] = r1 < 0.75 ? T : 140;
+        vy[i] = 0; vx[i] = 0;
+      } else {
+        vx[i] = blastBit | fuel;
+        fl[i] = 220; // le feu maintient sa température
+        vy[i] = 0;
+      }
+      return true;
+    }
+
+    // --- 4. Gaz : montée + wobble ; condensation/dissipation PAR REFROIDISSEMENT ---
+    if (type === T_GAS) {
+      const isSteam = id >= 180;
+      if (y === 0) T = Math.max(0, T - 8); // le sommet du monde est un ciel ouvert
+      if (isSteam && T < 60) {
+        grid[i] = 110 + variant; fl[i] = T; vy[i] = 0; vx[i] = 0; // pluie
+        return true;
+      }
+      if (!isSteam && T < 40) {
+        grid[i] = 0; fl[i] = T; vy[i] = 0; vx[i] = 0; // la fumée froide se dissout
+        return true;
+      }
+      fl[i] = T;
+      vy[i] = 0x80 | 2;
+      if (r1 < 0.3) vx[i] = (r2 < 0.5 ? 0x80 : 0) | 1;
+      return true;
+    }
+
+    // --- 5. Poudre : explose dès 90 degrés ou au souffle ---
+    if (isPowder(id) && ((T >= 90 && r1 < 0.9) || (nearBlast && r1 < 0.9))) {
+      grid[i] = 160 + variant;
+      vx[i] = 0x80 | (5 + ((r2 * 5) | 0));
+      fl[i] = 220; vy[i] = 0;
+      return true;
+    }
+
+    // --- 6. Souffle : éjection balistique des voisins mobiles ---
+    if (nearBlast && movable(id) && type !== T_STATIC && r1 < 0.8) {
+      const S = this.substepsPerFrame;
+      const fromBelow = y + 1 < h && blastAt(i + w, idDn);
+      const fromLeft = x > 0 && blastAt(i - 1, idLf);
+      const fromRight = x + 1 < w && blastAt(i + 1, idRt);
+      vy[i] = 0x80 | (fromBelow ? (S >> 1) : Math.max(1, S >> 2));
+      if (fromLeft && !fromRight) vx[i] = S >> 2;
+      else if (fromRight && !fromLeft) vx[i] = 0x80 | (S >> 2);
+      else if (r1 < 0.4) vx[i] = (r2 < 0.5 ? 0x80 : 0) | (S >> 2);
+      fl[i] = T;
+      return true;
+    }
+
+    // --- 7. Transitions de phase par température ---
+    // Lave : figeage DOUX (équilibres mesurés : ~201° à l'air libre, ~183°
+    // sous l'eau — protégée par son matelas de vapeur, effet Leidenfrost
+    // émergent). < 170 : fige toujours ; 170-190 : probabiliste (plus c'est
+    // froid, plus vite) ; >= 190 : reste en fusion. Refond à 230 (hystérésis).
+    // ... et UNIQUEMENT posée (du soutien dessous) : une coulée EN CHUTE ne
+    // fige jamais en vol (sinon : pierre statique qui lévite en plein air).
+    // ... ET au repos (vitesse ~nulle) : une colonne de coulée a du soutien
+    // local mais elle BOUGE — seule la lave posée et immobile peut croûter.
+    // ... ET sans voisin d'air (les bords d'un jet en chute sont exclus : les
+    // embouteillages transitoires de la file d'attente ne croûtent plus en vol).
+    const lavaSupported = y + 1 >= h || idDn !== 0;
+    const lavaAtRest = (vy[i] & 0x80) === 0 && (vy[i] & 0x7F) <= 1;
+    const noAirNeighbor = idUp !== 0 && idDn !== 0 && idLf !== 0 && idRt !== 0;
+    if (isLava(id) && lavaSupported && lavaAtRest && (noAirNeighbor || y + 1 >= h) && T < 190
+        && (T < 150 || r1 < (190 - T) * 0.012)) {
+      grid[i] = 140 + variant; fl[i] = T; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+    if (id >= 140 && id <= 149 && T >= 230) { // la pierre fond en lave
+      grid[i] = 190 + variant; fl[i] = T; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+    if (isIce(id) && T >= 40) { // la glace fond
+      grid[i] = 110 + variant; fl[i] = T; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+    if (isWater(id)) {
+      if (T >= 100) { // ébullition : la vapeur emporte la chaleur latente
+        grid[i] = 180 + variant; fl[i] = Math.max(T, 170); vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      if (T <= 24) { // gel (hystérésis avec la fonte à 40 ; ambiant 32 = sûr)
+        // la glace fraîche naît plus froide (chaleur latente de solidification
+        // évacuée) : le front de banquise se propage en s'affaiblissant
+        grid[i] = 200 + variant; fl[i] = Math.max(0, T - 8); vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      // une plante adjacente boit l'eau (croissance, non thermique)
+      if ((isPlant(idUp) || isPlant(idDn) || isPlant(idLf) || isPlant(idRt)) && r1 < 0.06) {
+        grid[i] = 210 + variant; fl[i] = T; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+    }
+    // Ignition par CONTACT direct avec feu/lave (flamme-pilote chimique)
+    if (FLAM[id] > 0) {
+      const hot = (v) => TYPE[v] === T_FIRE || isLava(v);
+      if ((hot(idUp) || hot(idDn) || hot(idLf) || hot(idRt)) && r1 < (FLAM[id] / 255) * 0.3) {
+        grid[i] = 160 + variant;
+        vx[i] = 20 + ((255 - FLAM[id]) >> 1) + ((r2 * 10) | 0);
+        fl[i] = 220; vy[i] = 0;
+        return true;
+      }
+    }
+    // Ignition par température (bois 150, plante 130, huile 120, alcool 105)
+    if (FLAM[id] > 0) {
+      const ign = id >= 150 && id <= 159 ? 150
+        : (isPlant(id) ? 130 : (id >= 120 && id <= 129 ? 120 : 105));
+      if (T >= ign && r1 < 0.5) {
+        grid[i] = 160 + variant;
+        vx[i] = 20 + ((255 - FLAM[id]) >> 1) + ((r2 * 10) | 0);
+        fl[i] = 220; vy[i] = 0;
+        return true;
+      }
+    }
+
+    // --- 8. Rien à transformer : on stocke la température et on continue ---
+    fl[i] = T;
+    if (type === T_STATIC) { vy[i] = 0; vx[i] = 0; return true; }
+    return false;
+  }
+
   velocityUpdate(salt) {
     const { w, h, grid, vy, vyN, vx } = this;
     const S = this.substepsPerFrame;
@@ -291,14 +553,19 @@ class Sim {
     // coïncident avec le bon appariement Margolus qu'une frame sur deux).
     const capLiquid = Math.max(1, S >> 1);
     vyN.set(vy); // instantané pré-mise-à-jour
-    if (this.engineTransforms) {
+    if (this.engineTransforms || this.engineHeat) {
       this.next.set(grid);   // snapshot ids pré-frame
-      this.flN.set(this.fl); // snapshot durées de vie (détection des souffles)
+      this.flN.set(this.fl); // snapshot durées de vie / températures
+      if (this.engineHeat) this.vxN.set(this.vx); // combustible du feu (souffles)
     }
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
-        if (this.engineTransforms && this.transformCell(i, x, y, salt)) continue;
+        if (this.engineHeat) {
+          if (this.transformCellHeat(i, x, y, salt)) continue;
+        } else if (this.engineTransforms && this.transformCell(i, x, y, salt)) {
+          continue;
+        }
         const id = grid[i];
         if (id === 0) { vy[i] = 0; vx[i] = 0; continue; }
         if (TYPE[id] === T_STATIC) { vy[i] = 0; vx[i] = 0; continue; }
@@ -415,6 +682,35 @@ class Sim {
           if (bFall || dRise) {
             t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
           }
+
+          // 1ter. Diagonale ASCENDANTE des gaz (miroir de l'éboulement des
+          //       tas) : un gaz bloqué droit au-dessus glisse en diagonale-haut
+          //       vers l'air — les nuages s'étalent sous les plafonds au lieu
+          //       de rester en blocs.
+          if (ev) {
+            const gasDiag = (oSrc, idSrc, idDiag, idAbove) =>
+              TYPE[idSrc] === T_GAS && idDiag === 0 && idAbove !== 0
+              && (vy[oSrc] & 0x80) !== 0 && this.bres(vy[oSrc] & 0x7F, sFrame);
+            // c (bas-gauche) monte en diagonale vers b (haut-droit)
+            if (gasDiag(oc, c, b, a)) {
+              t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t;
+            } else if (gasDiag(od, d, a, b)) {
+              t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t;
+            }
+          }
+
+          // 1bis. CONVECTION réelle (chaleur) : deux cellules d'AIR superposées
+          //       échangent leur charge utile si celle du bas est plus chaude —
+          //       l'air chaud MONTE à la cadence des sous-pas (panaches rapides).
+          //       Ids identiques : seule la chaleur voyage, rien ne bouge à l'écran.
+          if (this.engineHeat) {
+            if (a === 0 && c === 0 && fl[oc] > fl[oa]) {
+              t = oa; oa = oc; oc = t;
+            }
+            if (b === 0 && d === 0 && fl[od] > fl[ob]) {
+              t = ob; ob = od; od = t;
+            }
+          }
         }
 
         // 2. Diagonale quand la descente droite est bloquée.
@@ -480,7 +776,11 @@ class Sim {
     const densAbove = (p) => densAt(p.x, p.y - 1);
     const densBelow = (p) => densAt(p.x, p.y + 1);
     const blockedBelow = (p) => (p.y + 1 >= h) || grid[(p.y + 1) * w + p.x] !== 0;
-    const openAbove = (p) => (p.y - 1 < 0) || grid[(p.y - 1) * w + p.x] === 0;
+    const openAbove = (p) => {
+      if (p.y - 1 < 0) return true;
+      const a = grid[(p.y - 1) * w + p.x];
+      return a === 0 || TYPE[a] === T_GAS; // un gaz au-dessus = surface ouverte
+    };
 
     for (let y = 0; y < h; y++) {
       for (let x0 = offsetX; x0 + 1 < w; x0 += 2) {
@@ -497,8 +797,12 @@ class Sim {
           const mxL = vx[iL] & 0x7F;
           const mxR = vx[iR] & 0x7F;
           let vxSwap = false;
-          if (L !== 0 && R === 0 && mxL > 0 && (vx[iL] & 0x80) === 0 && self.bres(mxL, sFrame)) vxSwap = true;
-          else if (R !== 0 && L === 0 && mxR > 0 && (vx[iR] & 0x80) !== 0 && self.bres(mxR, sFrame)) vxSwap = true;
+          // (le feu stocke son COMBUSTIBLE dans vx, et les immobiles ne
+          //  glissent pas : exclus du mouvement latéral)
+          const mobileL = TYPE[L] !== T_FIRE && TYPE[L] !== T_STATIC;
+          const mobileR = TYPE[R] !== T_FIRE && TYPE[R] !== T_STATIC;
+          if (mobileL && L !== 0 && R === 0 && mxL > 0 && (vx[iL] & 0x80) === 0 && self.bres(mxL, sFrame)) vxSwap = true;
+          else if (mobileR && R !== 0 && L === 0 && mxR > 0 && (vx[iR] & 0x80) !== 0 && self.bres(mxR, sFrame)) vxSwap = true;
           if (vxSwap) {
             next[iL] = R; next[iR] = L;
             vyN[iL] = vy[iR]; vyN[iR] = vy[iL];
@@ -568,7 +872,7 @@ class Sim {
       this.grid[i] = id;
       this.vy[i] = vy0;
       this.vx[i] = 0;
-      this.fl[i] = 0;
+      this.fl[i] = this.engineHeat ? initTemp(id) : 0;
     }
   }
 
