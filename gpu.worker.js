@@ -264,10 +264,32 @@ bool isLavaId(uint id) { return id >= 190u && id <= 199u; }
 bool isIceId(uint id) { return id >= 200u && id <= 209u; }
 bool isPlantId(uint id) { return id >= 210u && id <= 219u; }
 bool isPowderId(uint id) { return id >= 220u && id <= 229u; }
-// « chaud » = feu ou lave (embrase / fait fondre / vaporise)
-bool isHot(uint id) { return typeOf(id) == T_FIRE || isLavaId(id); }
-// souffle : feu d'explosion (bit 7 de la durée de vie .a)
-bool isBlast(uvec4 n) { return typeOf(n.r) == T_FIRE && (n.a & 0x80u) != 0u; }
+// souffle : feu d'explosion (bit 7 du combustible, dans .b)
+bool isBlast(uvec4 n) { return typeOf(n.r) == T_FIRE && (n.b & 0x80u) != 0u; }
+
+// --- Thermique : .a = température (0..255), ambiant 32 ---
+const int AMBIENT = 32;
+const int CONV_BONUS = 24; // convection : dopage vertical au-dessus d'air/gaz chaud
+// Conductivité par matériau (en /64 par paire de voisins).
+// L'AIR est un vrai isolant (k=1) : la chaleur y voyage par CONVECTION.
+int condOf(uint id) {
+  if (id == 0u) return 1;
+  if (id < 110u) return 3;  // sable
+  if (id < 120u) return 8;  // eau
+  if (id < 130u) return 5;  // huile
+  if (id < 140u) return 6;  // alcool
+  if (id < 150u) return 5;  // pierre
+  if (id < 160u) return 2;  // bois
+  if (id < 170u) return 8;  // feu
+  if (id < 190u) return 6;  // fumée, vapeur
+  if (id < 200u) return 5;  // lave
+  if (id < 210u) return 8;  // glace (mord fort)
+  if (id < 220u) return 3;  // plante
+  return 3;                 // poudre
+}
+// Capacité thermique (décalage) : l'eau et la glace encaissent à demi-vitesse
+// (l'eau refroidit la lave AVANT de bouillir).
+int capOf(uint id) { if (typeOf(id) == T_GAS) return 3; return (isWaterId(id) || isIceId(id)) ? 1 : 0; }
 
 // Pierre et feu : ni mouvants ni déplaçables ; et jamais de solide à travers
 // un solide (le sable se pose SUR le bois au lieu de percoler).
@@ -322,21 +344,56 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, uvec4 lfCe
   float r2 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x3c6ef372u);
   uint variant = uint(r2 * 10.0);
 
-  // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu / de la lave.
+  // --- THERMIQUE : diffusion entière stable (instantané pré-frame), avec
+  // convection (conductivité verticale dopée quand le dessous est de l'air/du
+  // gaz plus chaud), capacité thermique (eau/glace encaissent à demi-vitesse),
+  // et arrondi stochastique (les petits gradients agissent dans la durée). ---
+  int T = int(me.a);
+  {
+    int tUp = int(aboveCell.a);
+    int tDn = int(belowCell.a);
+    int tLf = int(lfCell.a);
+    int tRt = int(rtCell.a);
+    int kMe = condOf(me.r);
+    int kUp = min(kMe, condOf(aboveCell.r));
+    int kDn = min(kMe, condOf(belowCell.r));
+    // Bonus convectif : AIR PUR seulement (les gaz transportent leur chaleur
+    // en se déplaçant, pas en super-conduisant).
+    if (belowCell.r == 0u && tDn > T) kDn += CONV_BONUS;
+    if (me.r == 0u && T > tUp) kUp += CONV_BONUS;
+    int kLf = min(kMe, condOf(lfCell.r));
+    int kRt = min(kMe, condOf(rtCell.r));
+    // Conduction gaz<->liquide FAIBLE : pas de re-vaporisation des gouttes
+    // qui retombent a travers les panaches (boucle = blizzard churne).
+    bool meGas = typeOf(me.r) == T_GAS;
+    bool meLiq = typeOf(me.r) == T_LIQUID;
+    if ((meGas && typeOf(aboveCell.r) == T_LIQUID) || (meLiq && typeOf(aboveCell.r) == T_GAS)) kUp = min(kUp, 2);
+    if ((meGas && typeOf(belowCell.r) == T_LIQUID) || (meLiq && typeOf(belowCell.r) == T_GAS)) kDn = min(kDn, 2);
+    if ((meGas && typeOf(lfCell.r) == T_LIQUID) || (meLiq && typeOf(lfCell.r) == T_GAS)) kLf = min(kLf, 2);
+    if ((meGas && typeOf(rtCell.r) == T_LIQUID) || (meLiq && typeOf(rtCell.r) == T_GAS)) kRt = min(kRt, 2);
+    int acc = (tUp - T) * kUp + (tDn - T) * kDn + (tLf - T) * kLf + (tRt - T) * kRt;
+    int capSh = 6 + capOf(me.r);
+    int dither = int(hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x7ed55d16u) * float(1 << capSh));
+    T += (acc + dither) >> capSh;
+    if (isLavaId(me.r)) T += (255 - T) >> 4; // masse thermique de la lave
+    if (me.r == 0u) T += (AMBIENT - T) >> 6; // l'air dissipe vers l'ambiant
+    T = clamp(T, 0, 255);
+  }
+  uint Tu = uint(T);
+
+  // --- Air : porte la température ; langues de flammes au-dessus du chaud ---
   if (me.r == 0u) {
     if (!floorBelow && (typeOf(belowCell.r) == T_FIRE || isLavaId(belowCell.r))) {
       float pFlame = isLavaId(belowCell.r) ? 0.04 : 0.12;
       float pSmoke = isLavaId(belowCell.r) ? 0.06 : 0.16;
-      if (r1 < pFlame) return uvec4(160u + variant, 0u, 0u, 4u + uint(r2 * 5.0));
-      if (r1 < pSmoke) return uvec4(170u + variant, 0u, 0u, 0u);
+      if (r1 < pFlame) return uvec4(160u + variant, 0u, 4u + uint(r2 * 5.0), 220u);
+      if (r1 < pSmoke) return uvec4(170u + variant, 0u, 0u, 140u);
     }
-    return uvec4(0u);
+    return uvec4(0u, 0u, 0u, Tu);
   }
 
   uint myType = typeOf(me.r);
 
-  bool nearHot = isHot(belowCell.r) || (!topAbove && isHot(aboveCell.r))
-    || isHot(lfCell.r) || isHot(rtCell.r);
   bool nearWater = isWaterId(belowCell.r) || isWaterId(aboveCell.r)
     || isWaterId(lfCell.r) || isWaterId(rtCell.r);
   bool blastBelow = !floorBelow && isBlast(belowCell);
@@ -344,82 +401,84 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, uvec4 lfCe
   bool blastRight = isBlast(rtCell);
   bool nearBlast = blastBelow || (!topAbove && isBlast(aboveCell)) || blastLeft || blastRight;
 
-  // Feu : vit sur place, éteint par l'eau, meurt en fumée ou en rien.
-  // Le bit 7 de la durée de vie marque un feu d'EXPLOSION (souffle).
+  // --- Feu : SOURCE (T=220), combustible dans .b (immobile : vx libre) ---
   if (myType == T_FIRE) {
-    uint blastBit = me.a & 0x80u;
-    uint life = me.a & 0x7Fu;
-    if (life == 0u) life = 25u + uint(r2 * 30.0);
-    if (nearWater && r1 < 0.6) return uvec4(170u + variant, 0u, 0u, 0u);
-    life--;
-    if (life <= 1u) {
-      return (r1 < 0.75) ? uvec4(0u) : uvec4(170u + variant, 0u, 0u, 0u);
+    uint blastBit = me.b & 0x80u;
+    uint fuel = me.b & 0x7Fu;
+    if (fuel == 0u) fuel = 25u + uint(r2 * 30.0);
+    if (nearWater && r1 < 0.6) return uvec4(170u + variant, 0u, 0u, 140u);
+    fuel--;
+    if (fuel <= 1u) {
+      return (r1 < 0.75) ? uvec4(0u, 0u, 0u, Tu) : uvec4(170u + variant, 0u, 0u, 140u);
     }
-    return uvec4(me.r, 0u, 0u, blastBit | life);
+    return uvec4(me.r, 0u, blastBit | fuel, 220u);
   }
 
-  // Gaz : durée de vie, montée permanente, wobble ; condensation de la vapeur.
+  // --- Gaz : montée + wobble ; condensation/dissipation PAR REFROIDISSEMENT ---
   if (myType == T_GAS) {
     bool isSteam = me.r >= 180u;
-    uint life = me.a;
-    if (life == 0u) life = isSteam ? (100u + uint(r2 * 100.0)) : (70u + uint(r2 * 80.0));
-    uint decay = (!topAbove && aboveCell.r != 0u) ? 3u : 1u; // plafond : plus vite
-    life = (life > decay) ? (life - decay) : 0u;
-    if (life <= 1u) {
-      if (isSteam && r1 < 0.5) return uvec4(110u + variant, 0u, 0u, 0u); // pluie
-      return uvec4(0u);
-    }
+    if (topAbove) T = max(0, T - 8); // le sommet du monde est un ciel ouvert
+    if (isSteam && T < 60) return uvec4(110u + variant, 0u, 0u, Tu); // pluie
+    if (!isSteam && T < 40) return uvec4(0u, 0u, 0u, Tu);
     uint wob = (r1 < 0.3) ? (((r2 < 0.5) ? 0x80u : 0u) | 1u) : 0u;
-    return uvec4(me.r, 0x80u | 2u, wob, life);
+    return uvec4(me.r, 0x80u | uint(max(3, uSubsteps >> 2)), wob, Tu);
   }
 
-  // Poudre : EXPLOSE au contact du chaud ou d'un souffle (chaîne éclair).
-  if (isPowderId(me.r) && (nearHot || nearBlast) && r1 < 0.9) {
-    return uvec4(160u + variant, 0u, 0u, 0x80u | (5u + uint(r2 * 5.0)));
+  // --- Poudre : explose dès 90 degrés ou au souffle ---
+  if (isPowderId(me.r) && ((T >= 90 && r1 < 0.9) || (nearBlast && r1 < 0.9))) {
+    return uvec4(160u + variant, 0u, 0x80u | (5u + uint(r2 * 5.0)), 220u);
   }
 
-  // Souffle : une cellule mobile voisine d'un feu d'explosion est ÉJECTÉE
-  // (impulsion balistique loin du souffle, composante vers le haut même en
-  // latéral : les explosions soulèvent) — c'est l'onde de choc.
+  // --- Souffle : éjection balistique des voisins mobiles ---
   if (nearBlast && myType != T_STATIC && r1 < 0.8) {
     uint S = uint(uSubsteps);
     me.g = 0x80u | (blastBelow ? (S >> 1) : max(1u, S >> 2));
     if (blastLeft && !blastRight) me.b = S >> 2;
     else if (blastRight && !blastLeft) me.b = 0x80u | (S >> 2);
     else if (r1 < 0.4) me.b = (((r2 < 0.5) ? 0x80u : 0u)) | (S >> 2);
+    me.a = Tu;
     return me;
   }
 
-  // Lave : fige en PIERRE au contact de l'eau (l'eau, elle, se vaporise).
-  if (isLavaId(me.r) && nearWater && r1 < 0.7) {
-    return uvec4(140u + variant, 0u, 0u, 0u);
+  // --- Transitions de phase par température ---
+  // Lave : figeage DOUX (équilibres mesurés : ~201° à l'air, ~183° sous l'eau,
+  // protégée par son matelas de vapeur — Leidenfrost émergent). Refond à 230.
+  // ... et UNIQUEMENT posée : une coulée en chute ne fige jamais en vol
+  // (sinon : pierre statique qui lévite en plein air).
+  // ... ET au repos : une colonne de coulée a du soutien local mais elle BOUGE.
+  // ... ET sans voisin d'air (bords de jet exclus : pas de croûte en vol).
+  bool lavaSupported = floorBelow || belowCell.r != 0u;
+  bool lavaAtRest = (me.g & 0x80u) == 0u && (me.g & 0x7Fu) <= 1u;
+  bool noAirNb = aboveCell.r != 0u && belowCell.r != 0u && lfCell.r != 0u && rtCell.r != 0u;
+  if (isLavaId(me.r) && lavaSupported && lavaAtRest && (noAirNb || floorBelow) && T < 190
+      && (T < 150 || r1 < float(190 - T) * 0.012)) {
+    return uvec4(140u + variant, 0u, 0u, Tu);
   }
-
-  // Glace : fond au contact du chaud.
-  if (isIceId(me.r) && nearHot && r1 < 0.5) {
-    return uvec4(110u + variant, 0u, 0u, 0u);
+  if (me.r >= 140u && me.r <= 149u && T >= 230) { // la pierre fond
+    return uvec4(190u + variant, 0u, 0u, Tu);
   }
-
-  // Combustion : un inflammable au contact du chaud s'embrase (vie de flamme
-  // selon le combustible : alcool bref et vif, bois durable).
-  float flam = flamOf(me.r);
-  if (flam > 0.0 && nearHot && r1 < flam * 0.3) {
-    uint life = 20u + ((255u - uint(flam * 255.0)) >> 1) + uint(r2 * 10.0);
-    return uvec4(160u + variant, 0u, 0u, life);
+  if (isIceId(me.r) && T >= 40) { // la glace fond
+    return uvec4(110u + variant, 0u, 0u, Tu);
   }
-
-  // Eau : vaporisée par le chaud ; gelée (lentement) par la glace adjacente ;
-  // bue par une plante adjacente (c'est ainsi que la plante pousse).
   if (isWaterId(me.r)) {
-    if (nearHot && r1 < 0.3) return uvec4(180u + variant, 0u, 0u, 0u);
-    bool nearIce = isIceId(belowCell.r) || isIceId(aboveCell.r) || isIceId(lfCell.r) || isIceId(rtCell.r);
-    if (nearIce && r1 < 0.015) return uvec4(200u + variant, 0u, 0u, 0u);
+    if (T >= 100) return uvec4(180u + variant, 0u, 0u, max(Tu, 170u)); // ébullition (chaleur latente)
+    if (T <= 24) return uvec4(200u + variant, 0u, 0u, uint(max(0, T - 8)));  // gel (latente évacuée)
     bool nearPlant = isPlantId(belowCell.r) || isPlantId(aboveCell.r) || isPlantId(lfCell.r) || isPlantId(rtCell.r);
-    if (nearPlant && r1 < 0.06) return uvec4(210u + variant, 0u, 0u, 0u);
+    if (nearPlant && r1 < 0.06) return uvec4(210u + variant, 0u, 0u, Tu);
+  }
+  // Ignition par température (bois 150, plante 130, huile 120, alcool 105)
+  float flam = flamOf(me.r);
+  if (flam > 0.0) {
+    int ign = (me.r >= 150u && me.r <= 159u) ? 150
+      : (isPlantId(me.r) ? 130 : ((me.r >= 120u && me.r <= 129u) ? 120 : 105));
+    if (T >= ign && r1 < 0.5) {
+      uint fuel = 20u + ((255u - uint(flam * 255.0)) >> 1) + uint(r2 * 10.0);
+      return uvec4(160u + variant, 0u, fuel, 220u);
+    }
   }
 
-  // Statique (pierre, bois, glace, plante non transformés) : immobile.
-  // APRÈS les transformations — le bois/la plante doivent pouvoir brûler.
+  // --- Rien à transformer : la température est stockée ---
+  me.a = Tu;
   if (myType == T_STATIC) { me.g = 0u; me.b = 0u; return me; }
 
   uint mx = me.b & 0x7Fu;
@@ -472,10 +531,10 @@ void main() {
     if (uFrameSub == 0) {
       bool floorB = cell.y + 1 >= uGrid.y;
       bool topB = cell.y - 1 < 0;
-      uvec4 below = floorB ? uvec4(0u) : fetchCell(cell + ivec2(0, 1));
-      uvec4 above = topB ? uvec4(0u) : fetchCell(cell + ivec2(0, -1));
-      uvec4 lf = (cell.x - 1 < 0) ? uvec4(0u) : fetchCell(cell + ivec2(-1, 0));
-      uvec4 rt = (cell.x + 1 >= uGrid.x) ? uvec4(0u) : fetchCell(cell + ivec2(1, 0));
+      uvec4 below = floorB ? uvec4(0u, 0u, 0u, 32u) : fetchCell(cell + ivec2(0, 1));
+      uvec4 above = topB ? uvec4(0u, 0u, 0u, 32u) : fetchCell(cell + ivec2(0, -1));
+      uvec4 lf = (cell.x - 1 < 0) ? uvec4(0u, 0u, 0u, 32u) : fetchCell(cell + ivec2(-1, 0));
+      uvec4 rt = (cell.x + 1 >= uGrid.x) ? uvec4(0u, 0u, 0u, 32u) : fetchCell(cell + ivec2(1, 0));
       me = updateVy(me, cell, below, above, lf, rt, floorB, topB);
     }
     outCell = me;
@@ -496,14 +555,14 @@ void main() {
     bool topAbove = corner.y - 1 < 0;
     bool leftEdge = corner.x - 1 < 0;
     bool rightEdge = corner.x + 2 >= uGrid.x;
-    uvec4 belowC = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(0, 2));
-    uvec4 belowD = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(1, 2));
-    uvec4 aboveA = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(0, -1));
-    uvec4 aboveB = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(1, -1));
-    uvec4 lfA = leftEdge ? uvec4(0u) : fetchCell(corner + ivec2(-1, 0));
-    uvec4 lfC = leftEdge ? uvec4(0u) : fetchCell(corner + ivec2(-1, 1));
-    uvec4 rtB = rightEdge ? uvec4(0u) : fetchCell(corner + ivec2(2, 0));
-    uvec4 rtD = rightEdge ? uvec4(0u) : fetchCell(corner + ivec2(2, 1));
+    uvec4 belowC = floorBelow ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(0, 2));
+    uvec4 belowD = floorBelow ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(1, 2));
+    uvec4 aboveA = topAbove ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(0, -1));
+    uvec4 aboveB = topAbove ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(1, -1));
+    uvec4 lfA = leftEdge ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(-1, 0));
+    uvec4 lfC = leftEdge ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(-1, 1));
+    uvec4 rtB = rightEdge ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(2, 0));
+    uvec4 rtD = rightEdge ? uvec4(0u, 0u, 0u, 32u) : fetchCell(corner + ivec2(2, 1));
     uvec4 a2 = updateVy(a, corner, c, aboveA, lfA, b, false, topAbove);
     uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, aboveB, a, rtB, false, topAbove);
     uvec4 c2 = updateVy(c, corner + ivec2(0, 1), belowC, a, lfC, d, floorBelow, false);
@@ -551,6 +610,11 @@ void main() {
     bool dRise = (d.g & 0x80u) != 0u && dd > db && pairOk(d.r, b.r) && bres(d.g & 0x7Fu, uFrameSub);
     if (bFall || dRise) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
   }
+
+  // 1bis. CONVECTION réelle : l'air chaud MONTE (échange de charge utile
+  //       entre deux cellules d'air superposées — seule la chaleur voyage).
+  if (a.r == 0u && c.r == 0u && c.a > a.a) { t = a; a = c; c = t; }
+  if (b.r == 0u && d.r == 0u && d.a > b.a) { t = b; b = d; d = t; }
 
   // 2. Diagonale quand la descente droite est bloquée (le dessous n'est pas
   //    plus léger). Dans le VIDE : cadence d'origine (éboulement des tas à
@@ -614,6 +678,7 @@ uniform int uSubsteps;  // S
 out uvec4 outCell;
 
 const uint LIQUID = 2u;
+const uint T_GAS = 4u; // pour le nivellement inversé des gaz
 const int K = 2;  // portée du scan de dénivelé (exact : la décision sature à 2)
 const int KS = 3; // portée du scan posé / en-transit
 
@@ -665,7 +730,20 @@ bool blockedBelow(ivec2 p) {
 bool openAbove(ivec2 p) {
   int ay = p.y - 1;
   if (ay < 0) return true;
-  return fetch(ivec2(p.x, ay)) == 0u;
+  uint a = fetch(ivec2(p.x, ay));
+  return a == 0u || typeOf(a) == T_GAS; // un gaz au-dessus = surface ouverte
+}
+
+// Miroirs verticaux, pour le nivellement INVERSÉ des gaz sous les plafonds.
+bool blockedAbove(ivec2 p) {
+  int ay = p.y - 1;
+  if (ay < 0) return true;
+  return fetch(ivec2(p.x, ay)) != 0u;
+}
+bool openBelow(ivec2 p) {
+  int by = p.y + 1;
+  if (by >= uGrid.y) return false;
+  return fetch(ivec2(p.x, by)) == 0u;
 }
 
 void main() {
@@ -692,26 +770,44 @@ void main() {
   if (uFlowPhase == 0) {
     uint mxL = L.b & 0x7Fu;
     uint mxR = R.b & 0x7Fu;
-    if (L.r != 0u && R.r == 0u && mxL > 0u && (L.b & 0x80u) == 0u && bres(mxL, uFlowSub)) {
+    // (le feu stocke son COMBUSTIBLE dans .b : exclu du mouvement latéral)
+    bool mobL = typeOf(L.r) != 5u && typeOf(L.r) != 3u; // ni feu ni statique
+    bool mobR = typeOf(R.r) != 5u && typeOf(R.r) != 3u;
+    if (mobL && L.r != 0u && R.r == 0u && mxL > 0u && (L.b & 0x80u) == 0u && bres(mxL, uFlowSub)) {
       doSwap = true;
-    } else if (R.r != 0u && L.r == 0u && mxR > 0u && (R.b & 0x80u) != 0u && bres(mxR, uFlowSub)) {
+    } else if (mobR && R.r != 0u && L.r == 0u && mxR > 0u && (R.b & 0x80u) != 0u && bres(mxR, uFlowSub)) {
       doSwap = true;
     }
   }
 
-  // A. Nivellement de surface (liquide↔vide) : « source en surface OU cible
-  //    soutenue ». L'eau DE SURFACE s'étale librement (ruissellement, cascades) ;
-  //    l'eau SUBMERGÉE ne glisse que vers une case posée sur quelque chose
-  //    (blockedBelow(cible)) — c'est la base d'une colonne qui s'effondre.
-  //    Pousser de l'eau submergée vers une case avec du vide dessous ne nivelle
-  //    rien : elle ne fait que tomber, et c'est ce qui déchiquetait en traits
-  //    horizontaux les cavités de vide peintes au pinceau. Un tube de void se
-  //    vide ainsi par le bas pendant que le vide sort par le haut.
-  if (!doSwap && lLiq && R.r == 0u && blockedBelow(lp) && openAbove(rp)
+  // A-gaz. Nivellement INVERSÉ : un gaz bloqué AU-DESSUS (plafond ou son
+  //        propre nuage) s'étale latéralement — miroir vertical de la règle A,
+  //        sinon la fumée s'accumule en tours inversées.
+  if (!doSwap && typeOf(L.r) == T_GAS && R.r == 0u && blockedAbove(lp) && openBelow(rp)
+      && (openBelow(lp) || blockedAbove(rp))) {
+    doSwap = true;
+  } else if (!doSwap && typeOf(R.r) == T_GAS && L.r == 0u && blockedAbove(rp) && openBelow(lp)
+      && (openBelow(rp) || blockedAbove(lp))) {
+    doSwap = true;
+  }
+
+  // A. Nivellement de surface (liquide↔vide OU GAZ : un rideau de vapeur ne
+  //    fait pas barrage à l'eau — elle le déplace, il remonte) : « source en
+  //    surface OU cible soutenue ». L'eau DE SURFACE s'étale librement
+  //    (ruissellement, cascades) ; l'eau SUBMERGÉE ne glisse que vers une case
+  //    posée sur quelque chose (blockedBelow(cible)) — c'est la base d'une
+  //    colonne qui s'effondre. Pousser de l'eau submergée vers une case avec
+  //    du vide dessous ne nivelle rien : elle ne fait que tomber, et c'est ce
+  //    qui déchiquetait en traits horizontaux les cavités de vide peintes au
+  //    pinceau. Un tube de void se vide ainsi par le bas pendant que le vide
+  //    sort par le haut.
+  bool passR = R.r == 0u || typeOf(R.r) == T_GAS;
+  bool passL = L.r == 0u || typeOf(L.r) == T_GAS;
+  if (!doSwap && lLiq && passR && blockedBelow(lp) && openAbove(rp)
       && (openAbove(lp) || blockedBelow(rp))) {
     // Viscosité : l'étalement se fait à la fluidité du liquide mouvant.
     doSwap = hash3(ivec2(cornerX, cell.y)) < fluidOf(L.r);
-  } else if (!doSwap && rLiq && L.r == 0u && blockedBelow(rp) && openAbove(lp)
+  } else if (!doSwap && rLiq && passL && blockedBelow(rp) && openAbove(lp)
       && (openAbove(rp) || blockedBelow(lp))) {
     doSwap = hash3(ivec2(cornerX, cell.y)) < fluidOf(R.r);
   } else if (!doSwap && lLiq && rLiq && dL != dR) {
@@ -807,11 +903,15 @@ void main() {
     color = BG;
   } else {
     color = texelFetch(uPalette, ivec2(int(id), 0), 0).rgb;
+    // Rougeoiement : au-dessus de ~150°, la matière irradie (la croûte de
+    // lave fraîche se VOIT refroidir, de l'orange vif au gris).
+    float glow = clamp((float(cellv.a) - 150.0) / 105.0, 0.0, 1.0);
+    if (glow > 0.0) color = mix(color, vec3(1.0, 0.42, 0.06), glow * 0.85);
   }
 
   // Vues de debug des canaux cachés (la charge utile est invisible au rendu
   // normal : sans ces vues, un canal perdu dans un échange serait indétectable).
-  if (uDebugView != 0 && id != 0u) {
+  if (uDebugView == 3 || (uDebugView != 0 && id != 0u)) {
     if (uDebugView == 1) {
       // vy : chaud (rouge/jaune) vers le bas, froid (cyan) vers le haut.
       float v = sm(cellv.g);
@@ -823,9 +923,11 @@ void main() {
       color = v >= 0.0 ? vec3(v, 0.1, 0.05) : vec3(0.05, 0.1, -v);
       color += vec3(0.08);
     } else {
-      // flags : 3 premiers bits -> R/G/B.
-      color = vec3(float(cellv.a & 1u), float((cellv.a >> 1) & 1u), float((cellv.a >> 2) & 1u));
-      color += vec3(0.08);
+      // caméra thermique : bleu (froid) -> jaune -> rouge (chaud), air compris.
+      float tt = float(cellv.a) / 255.0;
+      color = tt < 0.5
+        ? mix(vec3(0.05, 0.1, 0.45), vec3(0.95, 0.85, 0.2), tt * 2.0)
+        : mix(vec3(0.95, 0.85, 0.2), vec3(1.0, 0.1, 0.0), (tt - 0.5) * 2.0);
     }
   }
 
@@ -850,6 +952,15 @@ void main() {
 // ---------------------------------------------------------------------------
 
 // Choisit un id au hasard parmi les variantes du tool (void -> 0).
+function initTempOf(id) {
+  if (id >= 190 && id <= 199) return 255; // lave
+  if (id >= 160 && id <= 169) return 220; // feu
+  if (id >= 200 && id <= 209) return 4;   // glace
+  if (id >= 170 && id <= 179) return 180;  // fumée
+  if (id >= 180 && id <= 189) return 170;  // vapeur
+  return 32; // ambiant
+}
+
 function pickId(tool) {
   const ids = toolIds[tool];
   if (!ids || ids.length === 0) return 0;
@@ -876,7 +987,7 @@ function paint(cx, cy, size, tool) {
     // la source — le levier anti-colonnes le plus puissant (Noita/Powder Toy).
     brushPatch[1] = (Math.random() * 4) | 0;
     brushPatch[2] = 0;
-    brushPatch[3] = 0;
+    brushPatch[3] = initTempOf(brushPatch[0]);
     gl.texSubImage2D(
       gl.TEXTURE_2D, 0, cx, cy, 1, 1,
       gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, brushPatch,
@@ -899,7 +1010,7 @@ function paint(cx, cy, size, tool) {
       brushPatch[o] = pickId(tool);
       brushPatch[o + 1] = (Math.random() * 4) | 0; // émission randomisée
       brushPatch[o + 2] = 0;
-      brushPatch[o + 3] = 0;
+      brushPatch[o + 3] = initTempOf(brushPatch[o]);
     }
     gl.texSubImage2D(
       gl.TEXTURE_2D, 0, segMinX, y, segW, 1,
@@ -1161,9 +1272,11 @@ function initialize(opts) {
   // une largeur non multiple de 4 ferait échouer texImage2D → worker mort).
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-  // Textures d'état (data null : WebGL2 garantit l'initialisation à zéro = vide).
-  stateTex[0] = createStateTexture(null);
-  stateTex[1] = createStateTexture(null);
+  // Textures d'état : monde initialisé à vide ET à température ambiante (32).
+  const initState = new Uint8Array(gridWidth * gridHeight * 4);
+  for (let i = 3; i < initState.length; i += 4) initState[i] = 32;
+  stateTex[0] = createStateTexture(initState);
+  stateTex[1] = createStateTexture(initState);
   stateFbo[0] = createFbo(stateTex[0]);
   stateFbo[1] = createFbo(stateTex[1]);
   current = 0;

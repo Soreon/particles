@@ -282,10 +282,10 @@ canvasElement.addEventListener('wheel', (e) => {
   mouse.toolSize = toolNotch * toolSizeUnit;
 }, { passive: false });
 
-// Touche V : cycle des vues de debug du rendu (normal -> vy -> vx -> flags).
+// Touche V : cycle des vues de debug du rendu (normal -> vy -> vx -> temp).
 // Touches 1..9, 0 : sélection directe d'outil (via e.code Digit*, indépendant
 // de la disposition clavier — sur AZERTY les chiffres non shiftés marchent).
-const DEBUG_VIEWS = ['normal', 'vy', 'vx', 'flags'];
+const DEBUG_VIEWS = ['normal', 'vy', 'vx', 'temp'];
 let debugView = 0;
 window.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.altKey || e.metaKey) return;
