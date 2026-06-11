@@ -260,6 +260,14 @@ const uint T_FIRE = 5u;   // brûle sur place, embrase ses voisins, durée de vi
 
 float flamOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).a; } // inflammabilité 0..1
 bool isWaterId(uint id) { return id >= 110u && id <= 119u; }
+bool isLavaId(uint id) { return id >= 190u && id <= 199u; }
+bool isIceId(uint id) { return id >= 200u && id <= 209u; }
+bool isPlantId(uint id) { return id >= 210u && id <= 219u; }
+bool isPowderId(uint id) { return id >= 220u && id <= 229u; }
+// « chaud » = feu ou lave (embrase / fait fondre / vaporise)
+bool isHot(uint id) { return typeOf(id) == T_FIRE || isLavaId(id); }
+// souffle : feu d'explosion (bit 7 de la durée de vie .a)
+bool isBlast(uvec4 n) { return typeOf(n.r) == T_FIRE && (n.a & 0x80u) != 0u; }
 
 // Pierre et feu : ni mouvants ni déplaçables ; et jamais de solide à travers
 // un solide (le sable se pose SUR le bois au lieu de percoler).
@@ -314,32 +322,40 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, uvec4 lfCe
   float r2 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x3c6ef372u);
   uint variant = uint(r2 * 10.0);
 
-  // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu.
+  // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu / de la lave.
   if (me.r == 0u) {
-    if (!floorBelow && typeOf(belowCell.r) == T_FIRE) {
-      if (r1 < 0.12) return uvec4(160u + variant, 0u, 0u, 4u + uint(r2 * 5.0));
-      if (r1 < 0.16) return uvec4(170u + variant, 0u, 0u, 0u);
+    if (!floorBelow && (typeOf(belowCell.r) == T_FIRE || isLavaId(belowCell.r))) {
+      float pFlame = isLavaId(belowCell.r) ? 0.04 : 0.12;
+      float pSmoke = isLavaId(belowCell.r) ? 0.06 : 0.16;
+      if (r1 < pFlame) return uvec4(160u + variant, 0u, 0u, 4u + uint(r2 * 5.0));
+      if (r1 < pSmoke) return uvec4(170u + variant, 0u, 0u, 0u);
     }
     return uvec4(0u);
   }
 
   uint myType = typeOf(me.r);
 
-  bool nearFire = typeOf(belowCell.r) == T_FIRE || (!topAbove && typeOf(aboveCell.r) == T_FIRE)
-    || typeOf(lfCell.r) == T_FIRE || typeOf(rtCell.r) == T_FIRE;
+  bool nearHot = isHot(belowCell.r) || (!topAbove && isHot(aboveCell.r))
+    || isHot(lfCell.r) || isHot(rtCell.r);
   bool nearWater = isWaterId(belowCell.r) || isWaterId(aboveCell.r)
     || isWaterId(lfCell.r) || isWaterId(rtCell.r);
+  bool blastBelow = !floorBelow && isBlast(belowCell);
+  bool blastLeft = isBlast(lfCell);
+  bool blastRight = isBlast(rtCell);
+  bool nearBlast = blastBelow || (!topAbove && isBlast(aboveCell)) || blastLeft || blastRight;
 
   // Feu : vit sur place, éteint par l'eau, meurt en fumée ou en rien.
+  // Le bit 7 de la durée de vie marque un feu d'EXPLOSION (souffle).
   if (myType == T_FIRE) {
-    uint life = me.a;
+    uint blastBit = me.a & 0x80u;
+    uint life = me.a & 0x7Fu;
     if (life == 0u) life = 25u + uint(r2 * 30.0);
     if (nearWater && r1 < 0.6) return uvec4(170u + variant, 0u, 0u, 0u);
     life--;
     if (life <= 1u) {
       return (r1 < 0.75) ? uvec4(0u) : uvec4(170u + variant, 0u, 0u, 0u);
     }
-    return uvec4(me.r, 0u, 0u, life);
+    return uvec4(me.r, 0u, 0u, blastBit | life);
   }
 
   // Gaz : durée de vie, montée permanente, wobble ; condensation de la vapeur.
@@ -357,21 +373,53 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, uvec4 lfCe
     return uvec4(me.r, 0x80u | 2u, wob, life);
   }
 
-  // Combustion : un inflammable au contact du feu s'embrase (vie de flamme
+  // Poudre : EXPLOSE au contact du chaud ou d'un souffle (chaîne éclair).
+  if (isPowderId(me.r) && (nearHot || nearBlast) && r1 < 0.9) {
+    return uvec4(160u + variant, 0u, 0u, 0x80u | (5u + uint(r2 * 5.0)));
+  }
+
+  // Souffle : une cellule mobile voisine d'un feu d'explosion est ÉJECTÉE
+  // (impulsion balistique loin du souffle, composante vers le haut même en
+  // latéral : les explosions soulèvent) — c'est l'onde de choc.
+  if (nearBlast && myType != T_STATIC && r1 < 0.8) {
+    uint S = uint(uSubsteps);
+    me.g = 0x80u | (blastBelow ? (S >> 1) : max(1u, S >> 2));
+    if (blastLeft && !blastRight) me.b = S >> 2;
+    else if (blastRight && !blastLeft) me.b = 0x80u | (S >> 2);
+    else if (r1 < 0.4) me.b = (((r2 < 0.5) ? 0x80u : 0u)) | (S >> 2);
+    return me;
+  }
+
+  // Lave : fige en PIERRE au contact de l'eau (l'eau, elle, se vaporise).
+  if (isLavaId(me.r) && nearWater && r1 < 0.7) {
+    return uvec4(140u + variant, 0u, 0u, 0u);
+  }
+
+  // Glace : fond au contact du chaud.
+  if (isIceId(me.r) && nearHot && r1 < 0.5) {
+    return uvec4(110u + variant, 0u, 0u, 0u);
+  }
+
+  // Combustion : un inflammable au contact du chaud s'embrase (vie de flamme
   // selon le combustible : alcool bref et vif, bois durable).
   float flam = flamOf(me.r);
-  if (flam > 0.0 && nearFire && r1 < flam * 0.3) {
+  if (flam > 0.0 && nearHot && r1 < flam * 0.3) {
     uint life = 20u + ((255u - uint(flam * 255.0)) >> 1) + uint(r2 * 10.0);
     return uvec4(160u + variant, 0u, 0u, life);
   }
 
-  // Eau au contact du feu : vaporisation.
-  if (isWaterId(me.r) && nearFire && r1 < 0.3) {
-    return uvec4(180u + variant, 0u, 0u, 0u);
+  // Eau : vaporisée par le chaud ; gelée (lentement) par la glace adjacente ;
+  // bue par une plante adjacente (c'est ainsi que la plante pousse).
+  if (isWaterId(me.r)) {
+    if (nearHot && r1 < 0.3) return uvec4(180u + variant, 0u, 0u, 0u);
+    bool nearIce = isIceId(belowCell.r) || isIceId(aboveCell.r) || isIceId(lfCell.r) || isIceId(rtCell.r);
+    if (nearIce && r1 < 0.015) return uvec4(200u + variant, 0u, 0u, 0u);
+    bool nearPlant = isPlantId(belowCell.r) || isPlantId(aboveCell.r) || isPlantId(lfCell.r) || isPlantId(rtCell.r);
+    if (nearPlant && r1 < 0.06) return uvec4(210u + variant, 0u, 0u, 0u);
   }
 
-  // Statique (pierre, bois non embrasé) : immobile, charge utile nulle.
-  // APRÈS les tests d'inflammabilité — le bois statique doit pouvoir brûler.
+  // Statique (pierre, bois, glace, plante non transformés) : immobile.
+  // APRÈS les transformations — le bois/la plante doivent pouvoir brûler.
   if (myType == T_STATIC) { me.g = 0u; me.b = 0u; return me; }
 
   uint mx = me.b & 0x7Fu;

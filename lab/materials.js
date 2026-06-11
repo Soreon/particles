@@ -31,6 +31,14 @@ register('wood', 150, 255, T_STATIC, 0, 140);
 register('fire', 160, 0, T_FIRE);
 register('smoke', 170, 1, T_GAS);
 register('steam', 180, 1, T_GAS);
+// Lave : feu liquide, très visqueuse, dense — fige en pierre au contact de l'eau.
+register('lava', 190, 8, T_LIQUID, 0.12);
+// Glace : statique — fond près du feu/lave, gèle l'eau adjacente (lentement).
+register('ice', 200, 255, T_STATIC);
+// Plante : statique inflammable — boit l'eau adjacente pour pousser.
+register('plant', 210, 255, T_STATIC, 0, 190);
+// Poudre : granulaire — EXPLOSE au contact du feu/lave (souffle + éjections).
+register('powder', 220, 7, T_SOLID);
 
 const MATERIAL_IDS = {
   void: [0],
@@ -43,6 +51,10 @@ const MATERIAL_IDS = {
   fire: Array.from({ length: 10 }, (_, i) => 160 + i),
   smoke: Array.from({ length: 10 }, (_, i) => 170 + i),
   steam: Array.from({ length: 10 }, (_, i) => 180 + i),
+  lava: Array.from({ length: 10 }, (_, i) => 190 + i),
+  ice: Array.from({ length: 10 }, (_, i) => 200 + i),
+  plant: Array.from({ length: 10 }, (_, i) => 210 + i),
+  powder: Array.from({ length: 10 }, (_, i) => 220 + i),
 };
 
 module.exports = {

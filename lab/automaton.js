@@ -132,7 +132,7 @@ class Sim {
   // (this.next sert de snapshot) — sans conflit, comme les invocations GPU.
   // Renvoie true si le sort de la cellule est entièrement réglé pour la frame.
   transformCell(i, x, y, salt) {
-    const { w, h, grid, next, vy, vx, fl } = this;
+    const { w, h, grid, next, vy, vx, fl, flN } = this;
     const id = next[i]; // état pré-frame
     const type = TYPE[id];
     const up = y > 0 ? next[i - w] : 0;
@@ -143,16 +143,28 @@ class Sim {
     const r2 = hash01(x, y, salt ^ 0x3c6ef372);
     const variant = (r2 * 10) | 0;
 
-    // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu.
+    const isWater = (v) => v >= 110 && v <= 119;
+    const isLava = (v) => v >= 190 && v <= 199;
+    const isIce = (v) => v >= 200 && v <= 209;
+    const isPowder = (v) => v >= 220 && v <= 229;
+    const isPlant = (v) => v >= 210 && v <= 219;
+    // « chaud » = feu ou lave (les deux embrasent / font fondre / vaporisent)
+    const hot = (v) => TYPE[v] === T_FIRE || isLava(v);
+    // souffle : feu d'explosion (bit 7 de la durée de vie, payload pré-frame)
+    const blastAt = (j, v) => TYPE[v] === T_FIRE && (flN[j] & 0x80) !== 0;
+
+    // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu/de la lave.
     if (id === 0) {
-      if (TYPE[dn] === T_FIRE) {
-        if (r1 < 0.12) {
+      if (TYPE[dn] === T_FIRE || isLava(dn)) {
+        const pFlame = isLava(dn) ? 0.04 : 0.12;
+        const pSmoke = isLava(dn) ? 0.06 : 0.16;
+        if (r1 < pFlame) {
           grid[i] = 160 + variant; // langue de flamme, vie courte
           fl[i] = 4 + ((r2 * 5) | 0);
           vy[i] = 0; vx[i] = 0;
           return true;
         }
-        if (r1 < 0.16) {
+        if (r1 < pSmoke) {
           grid[i] = 170 + variant; // bouffée de fumée
           fl[i] = 0;
           vy[i] = 0; vx[i] = 0;
@@ -162,22 +174,27 @@ class Sim {
       return false;
     }
 
-    const nearFire = TYPE[up] === T_FIRE || TYPE[dn] === T_FIRE
-      || TYPE[lf] === T_FIRE || TYPE[rt] === T_FIRE;
-    const isWater = (v) => v >= 110 && v <= 119;
+    const nearHot = hot(up) || hot(dn) || hot(lf) || hot(rt);
     const nearWater = isWater(up) || isWater(dn) || isWater(lf) || isWater(rt);
+    const nearBlast = (y > 0 && blastAt(i - w, up)) || (y + 1 < h && blastAt(i + w, dn))
+      || (x > 0 && blastAt(i - 1, lf)) || (x + 1 < w && blastAt(i + 1, rt));
 
     // Feu : vit sur place, éteint par l'eau, meurt en fumée ou en rien.
+    // Le bit 7 de la durée de vie marque un feu d'EXPLOSION (souffle).
     if (type === T_FIRE) {
-      if (fl[i] === 0) fl[i] = 25 + ((r2 * 30) | 0); // allumage frais
+      const blastBit = fl[i] & 0x80;
+      let life = fl[i] & 0x7F;
+      if (life === 0) life = 25 + ((r2 * 30) | 0); // allumage frais
       if (nearWater && r1 < 0.6) {
         grid[i] = 170 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
         return true;
       }
-      fl[i]--;
-      if (fl[i] <= 1) {
+      life--;
+      if (life <= 1) {
         grid[i] = r1 < 0.75 ? 0 : 170 + variant;
         fl[i] = 0; vy[i] = 0; vx[i] = 0;
+      } else {
+        fl[i] = blastBit | life;
       }
       return true;
     }
@@ -202,19 +219,65 @@ class Sim {
       return true;
     }
 
-    // Combustion : un inflammable au contact du feu s'embrase (durée de vie
+    // Poudre : EXPLOSE au contact du chaud ou d'un souffle (chaîne éclair).
+    if (isPowder(id) && (nearHot || nearBlast) && r1 < 0.9) {
+      grid[i] = 160 + variant;
+      fl[i] = 0x80 | (5 + ((r2 * 5) | 0)); // feu d'explosion : bref + souffle
+      vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    // Souffle : une cellule mobile voisine d'un feu d'explosion est ÉJECTÉE
+    // (impulsion balistique loin du souffle, avec une composante vers le haut
+    // même en latéral : les explosions soulèvent) — c'est l'onde de choc.
+    if (nearBlast && movable(id) && type !== T_STATIC && r1 < 0.8) {
+      const S = this.substepsPerFrame;
+      const fromBelow = y + 1 < h && blastAt(i + w, dn);
+      const fromLeft = x > 0 && blastAt(i - 1, lf);
+      const fromRight = x + 1 < w && blastAt(i + 1, rt);
+      vy[i] = 0x80 | (fromBelow ? (S >> 1) : Math.max(1, S >> 2));
+      if (fromLeft && !fromRight) vx[i] = S >> 2;          // poussée à droite
+      else if (fromRight && !fromLeft) vx[i] = 0x80 | (S >> 2); // à gauche
+      else if (r1 < 0.4) vx[i] = (r2 < 0.5 ? 0x80 : 0) | (S >> 2);
+      return true;
+    }
+
+    // Lave : fige en PIERRE au contact de l'eau (l'eau, elle, se vaporise).
+    if (isLava(id) && nearWater && r1 < 0.7) {
+      grid[i] = 140 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    // Glace : fond au contact du chaud.
+    if (isIce(id) && nearHot && r1 < 0.5) {
+      grid[i] = 110 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    // Combustion : un inflammable au contact du chaud s'embrase (durée de vie
     // de la flamme selon le combustible : alcool bref et vif, bois durable).
-    if (FLAM[id] > 0 && nearFire && r1 < (FLAM[id] / 255) * 0.3) {
+    if (FLAM[id] > 0 && nearHot && r1 < (FLAM[id] / 255) * 0.3) {
       grid[i] = 160 + variant;
       fl[i] = 20 + ((255 - FLAM[id]) >> 1) + ((r2 * 10) | 0);
       vy[i] = 0; vx[i] = 0;
       return true;
     }
 
-    // Eau au contact du feu : vaporisation.
-    if (isWater(id) && nearFire && r1 < 0.3) {
-      grid[i] = 180 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
-      return true;
+    // Eau : vaporisée par le chaud ; gelée (lentement) par la glace adjacente ;
+    // bue par une plante adjacente (c'est ainsi que la plante pousse).
+    if (isWater(id)) {
+      if (nearHot && r1 < 0.3) {
+        grid[i] = 180 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      if ((isIce(up) || isIce(dn) || isIce(lf) || isIce(rt)) && r1 < 0.015) {
+        grid[i] = 200 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      if ((isPlant(up) || isPlant(dn) || isPlant(lf) || isPlant(rt)) && r1 < 0.06) {
+        grid[i] = 210 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
     }
 
     return false;
@@ -228,7 +291,10 @@ class Sim {
     // coïncident avec le bon appariement Margolus qu'une frame sur deux).
     const capLiquid = Math.max(1, S >> 1);
     vyN.set(vy); // instantané pré-mise-à-jour
-    if (this.engineTransforms) this.next.set(grid); // snapshot ids pré-frame
+    if (this.engineTransforms) {
+      this.next.set(grid);   // snapshot ids pré-frame
+      this.flN.set(this.fl); // snapshot durées de vie (détection des souffles)
+    }
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;

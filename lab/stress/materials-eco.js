@@ -112,3 +112,88 @@ function count(sim, name) {
   const steamLeft = count(sim, 'steam');
   console.log(`gaz : fumée vue en haut ${topSmoke > 0 ? 'oui' : 'NON'}, dissipée (${smokeLeft} restante), vapeur ${steam0}->${steamLeft}, pluie max ${rained} cellules ${topSmoke > 0 && smokeLeft === 0 && rained > 0 ? 'OK (cycle complet)' : 'ÉCHEC'}`);
 }
+
+// --- 6. Lave : fige en pierre au contact de l'eau (+ vapeur) ---
+{
+  const sim = new Sim(64, 64, rule, 1);
+  const rng = makeRng(46);
+  sim.fillRect(0, 50, 63, 63, 'lava', rng);
+  sim.fillRect(20, 20, 43, 30, 'water', rng);
+  let steamSeen = 0;
+  for (let f = 0; f < 300; f++) {
+    sim.frame();
+    steamSeen = Math.max(steamSeen, count(sim, 'steam'));
+  }
+  const stone = count(sim, 'stone');
+  console.log(`lave : pierre formée = ${stone}, pic vapeur = ${steamSeen} ${stone > 20 && steamSeen > 3 ? 'OK (fige + vaporise)' : 'ÉCHEC'}`);
+}
+
+// --- 7. Glace : gèle l'eau adjacente, fond près du feu ---
+{
+  const sim = new Sim(64, 64, rule, 1);
+  const rng = makeRng(47);
+  sim.fillRect(0, 50, 63, 63, 'water', rng);
+  sim.fillRect(28, 48, 35, 49, 'ice', rng); // glaçon posé sur l'eau
+  const ice0 = count(sim, 'ice');
+  for (let f = 0; f < 400; f++) sim.frame();
+  const iceGrown = count(sim, 'ice');
+  // Phase de fonte : on retire l'eau restante (le gel rampant s'arrête — on ne
+  // mesure QUE la fonte), puis du feu ré-allumé directement AU CONTACT.
+  for (let i = 0; i < sim.grid.length; i++) {
+    if (NAME_OF[sim.grid[i]] === 'water') { sim.grid[i] = 0; sim.vy[i] = 0; sim.vx[i] = 0; sim.fl[i] = 0; }
+  }
+  for (let f = 0; f < 250; f++) {
+    if (f % 20 === 0) {
+      // nappe de feu posée sur la première cellule de glace de chaque colonne
+      for (let x = 0; x < 64; x++) {
+        for (let y = 1; y < 63; y++) {
+          if (NAME_OF[sim.get(x, y + 1)] === 'ice' && sim.get(x, y) === 0) { sim.set(x, y, 160, 0); break; }
+        }
+      }
+    }
+    sim.frame();
+  }
+  const iceMelted = count(sim, 'ice');
+  console.log(`glace : ${ice0} -> ${iceGrown} (gel rampant) -> ${iceMelted} après feu ${iceGrown > ice0 * 1.5 && iceMelted < iceGrown ? 'OK (gèle puis fond)' : 'ÉCHEC'}`);
+}
+
+// --- 8. Plante : boit l'eau pour pousser, puis brûle ---
+{
+  const sim = new Sim(64, 64, rule, 1);
+  const rng = makeRng(48);
+  sim.fillRect(0, 52, 63, 63, 'water', rng);
+  sim.fillRect(30, 50, 33, 51, 'plant', rng); // bouture au bord de l'eau
+  const plant0 = count(sim, 'plant');
+  const water0 = count(sim, 'water');
+  for (let f = 0; f < 500; f++) sim.frame();
+  const plantGrown = count(sim, 'plant');
+  const waterDrunk = water0 - count(sim, 'water');
+  sim.fillRect(28, 40, 35, 49, 'fire', rng); // on y met le feu
+  for (let f = 0; f < 400; f++) sim.frame();
+  const plantBurned = count(sim, 'plant');
+  console.log(`plante : ${plant0} -> ${plantGrown} (a bu ~${waterDrunk} d'eau) -> ${plantBurned} après feu ${plantGrown > plant0 * 2 && plantBurned < plantGrown ? 'OK (pousse puis brûle)' : 'ÉCHEC'}`);
+}
+
+// --- 9. Poudre : explose en chaîne avec souffle (éjections balistiques) ---
+{
+  const sim = new Sim(64, 64, rule, 1);
+  const rng = makeRng(49);
+  sim.fillRect(24, 56, 39, 63, 'powder', rng); // baril de poudre au sol
+  sim.fillRect(24, 52, 39, 55, 'sand', rng);   // sable PAR-DESSUS (témoin de fontaine)
+  sim.fillRect(10, 60, 23, 63, 'sand', rng);   // et à côté (témoin du souffle latéral)
+  const powder0 = count(sim, 'powder');
+  sim.fillRect(23, 59, 23, 59, 'fire', rng);   // étincelle sur le flanc
+  let ejected = 0; // cellules en ascension balistique (sable/poudre soufflés)
+  let burnFrames = 0;
+  for (let f = 0; f < 200; f++) {
+    sim.frame();
+    if (count(sim, 'powder') > 0) burnFrames = f;
+    let up = 0;
+    for (let i = 0; i < sim.grid.length; i++) {
+      if (sim.grid[i] !== 0 && (sim.vy[i] & 0x80) !== 0 && sim.grid[i] < 160) up++;
+    }
+    ejected = Math.max(ejected, up);
+  }
+  const powderLeft = count(sim, 'powder');
+  console.log(`poudre : ${powder0} -> ${powderLeft} (consommée en ~${burnFrames}f), pic d'éjections balistiques = ${ejected} ${powderLeft === 0 && burnFrames < 60 && ejected > 10 ? 'OK (explosion + souffle)' : 'ÉCHEC'}`);
+}
