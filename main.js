@@ -68,6 +68,7 @@ function buildLookupTables() {
       palette[id * 4 + 3] = 255;
     }
     props[id * 4 + 0] = mat.density || 0;
+    props[id * 4 + 2] = Math.round((mat.fluidity || 0) * 255);
     if (mat.type === 'solid') props[id * 4 + 1] = TYPE_SOLID;
     else if (mat.type === 'liquid') props[id * 4 + 1] = TYPE_LIQUID;
     else props[id * 4 + 1] = TYPE_VOID;

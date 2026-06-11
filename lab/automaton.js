@@ -3,7 +3,7 @@
 // La passe d'écoulement est enfichable (lab/rules/*.js) pour comparer des
 // variantes de règles sur les mêmes scénarios.
 
-const { DENS, TYPE, T_SOLID, T_LIQUID, MATERIAL_IDS } = require('./materials');
+const { DENS, TYPE, FLUID, T_SOLID, T_LIQUID, MATERIAL_IDS } = require('./materials');
 
 // Hash déterministe -> [0,1) (équivalent du hash() des shaders).
 function hash01(x, y, salt) {
@@ -36,6 +36,7 @@ class Sim {
     // jitterP : probabilité de glissade diagonale de traînée en vol.
     const eng = (flowRule && flowRule.engine) || {};
     this.engineVelocity = !!eng.velocity;
+    this.engineViscosity = !!eng.viscosity;
     this.G = eng.G || 1;
     this.jitterP = eng.jitterP || 0;
     this.grid = new Uint8Array(w * h);
@@ -133,7 +134,7 @@ class Sim {
         // les liquides glissent. vx n'est jamais entretenu (pas de fossile).
         const mxOld = vx[i] & 0x7F;
         if (mxOld > 0) {
-          const fr = TYPE[id] === T_SOLID ? 2 : 1;
+          const fr = TYPE[id] === T_SOLID ? 2 : (this.engineViscosity && FLUID[id] < 128 ? 2 : 1);
           const mx = mxOld - fr;
           vx[i] = mx > 0 ? ((vx[i] & 0x80) | mx) : 0;
         }
@@ -156,7 +157,8 @@ class Sim {
           // Chute possible : gravité stochastique, plafond selon le milieu.
           const j = hash01(x, y, salt + this.seed * 31337);
           m += this.G + (j < 0.33 ? -1 : (j < 0.66 ? 0 : 1));
-          const cap = below === 0 ? S : capLiquid;
+          let cap = below === 0 ? S : capLiquid;
+          if (this.engineViscosity && below !== 0) cap = Math.max(1, (cap * FLUID[below] / 255) | 0);
           if (m < 1) m = 1;
           if (m > cap) m = cap;
           vy[i] = m;
@@ -219,12 +221,19 @@ class Sim {
         //    ascension). Branche symétrique : une particule ÉJECTÉE (vy signé
         //    haut) monte dans plus léger qu'elle — l'arc balistique du splash.
         {
-          const aFall = da > dc && (!ev || ((vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame)));
+          // Gate de porteur visqueux : tomber DANS un liquide passe aussi le
+          // filtre de sa fluidité — vitesses effectives fractionnaires
+          // (< 1 case/frame dans l'huile), impossibles via vy seul (plancher
+          // à 1 + taxe d'alignement qui écrase les différences de cap).
+          const hashC = this.engineViscosity ? hash01(x0, y0, salt ^ 0x68bc21eb) : 0;
+          const carrierOk = (target) => !this.engineViscosity || target === 0
+            || TYPE[target] !== T_LIQUID || hashC < FLUID[target] / 255;
+          const aFall = da > dc && (!ev || ((vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame))) && carrierOk(c);
           const cRise = ev && (vy[oc] & 0x80) !== 0 && dc > da && this.bres(vy[oc] & 0x7F, sFrame);
           if (aFall || cRise) {
             t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t;
           }
-          const bFall = db > dd && (!ev || ((vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame)));
+          const bFall = db > dd && (!ev || ((vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame))) && carrierOk(d);
           const dRise = ev && (vy[od] & 0x80) !== 0 && dd > db && this.bres(vy[od] & 0x7F, sFrame);
           if (bFall || dRise) {
             t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
@@ -236,9 +245,22 @@ class Sim {
         //    est un liquide (sinon les avalanches diagonales en escalier
         //    descendent un tas immergé à pleine cadence, comme dans du vide).
         //    Dans le vide/air : cadence d'origine (éboulement des tas intact).
-        // (les particules en ascension balistique sont exclues des diagonales)
-        const gA = () => !ev || ((vy[oa] & 0x80) === 0 && (d === 0 || this.bres(vy[oa] & 0x7F, sFrame)));
-        const gB = () => !ev || ((vy[ob] & 0x80) === 0 && (c === 0 || this.bres(vy[ob] & 0x7F, sFrame)));
+        // (les particules en ascension balistique sont exclues des diagonales ;
+        //  avec viscosité, les liquides glissent en diagonale à leur fluidité —
+        //  l'huile avale ses pentes lentement, en cohérence avec son nivellement)
+        const hashV = this.engineViscosity ? hash01(x0, y0, salt ^ 0x2545f491) : 0;
+        const gA = () => {
+          if (!ev) return true;
+          if ((vy[oa] & 0x80) !== 0) return false;
+          if (this.engineViscosity && TYPE[a] === T_LIQUID && hashV >= FLUID[a] / 255) return false;
+          return d === 0 || this.bres(vy[oa] & 0x7F, sFrame);
+        };
+        const gB = () => {
+          if (!ev) return true;
+          if ((vy[ob] & 0x80) !== 0) return false;
+          if (this.engineViscosity && TYPE[b] === T_LIQUID && hashV >= FLUID[b] / 255) return false;
+          return c === 0 || this.bres(vy[ob] & 0x7F, sFrame);
+        };
         if (rnd < 0.5) {
           if (da > dd && dc >= da && gA()) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
           if (db > dc && dd >= db && gB()) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
@@ -323,6 +345,7 @@ class Sim {
           densAt,
           idAt: (x, yy) => ((x < 0 || x >= w || yy < 0 || yy >= h) ? -1 : grid[yy * w + x]),
           rnd: hash01(x0, y, salt + self.seed * 104729),
+          rnd2: hash01(x0, y, salt ^ 0x7f4a7c15),
         };
         if (self.flowRule(ctx)) {
           next[iL] = R;

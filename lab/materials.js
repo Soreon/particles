@@ -4,21 +4,23 @@ const T_SOLID = 1;
 const T_LIQUID = 2;
 
 const DENS = new Uint8Array(256);
+const FLUID = new Uint8Array(256); // fluidité 0..255 (255 = parfaitement fluide)
 const TYPE = new Uint8Array(256);
 const NAME_OF = new Array(256).fill('void');
 
-function register(name, idStart, density, type) {
+function register(name, idStart, density, type, fluidity = 0) {
   for (let id = idStart; id < idStart + 10; id++) {
     DENS[id] = density;
     TYPE[id] = type;
     NAME_OF[id] = name;
+    FLUID[id] = Math.round(fluidity * 255);
   }
 }
 
 register('sand', 100, 10, T_SOLID);
-register('water', 110, 5, T_LIQUID);
-register('oil', 120, 6, T_LIQUID);
-register('alcool', 130, 4, T_LIQUID);
+register('water', 110, 5, T_LIQUID, 0.8);
+register('oil', 120, 6, T_LIQUID, 0.25);
+register('alcool', 130, 4, T_LIQUID, 1.0);
 
 const MATERIAL_IDS = {
   void: [0],
@@ -28,4 +30,4 @@ const MATERIAL_IDS = {
   alcool: Array.from({ length: 10 }, (_, i) => 130 + i),
 };
 
-module.exports = { DENS, TYPE, NAME_OF, MATERIAL_IDS, T_VOID, T_SOLID, T_LIQUID };
+module.exports = { DENS, TYPE, FLUID, NAME_OF, MATERIAL_IDS, T_VOID, T_SOLID, T_LIQUID };

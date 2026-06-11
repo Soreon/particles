@@ -1,8 +1,8 @@
 const materials = new Map();
 const SAND = { name: 'sand', density: 10, friction: 1, type: 'solid' };
-const WATER = { name: 'water', density: 5, friction: 0, type: 'liquid' };
-const OIL = { name: 'oil', density: 6, friction: 0, type: 'liquid' };
-const ALCOOL = { name: 'alcool', density: 4, friction: 0, type: 'liquid' };
+const WATER = { name: 'water', density: 5, friction: 0, type: 'liquid', fluidity: 0.8 };
+const OIL = { name: 'oil', density: 6, friction: 0, type: 'liquid', fluidity: 0.25 };
+const ALCOOL = { name: 'alcool', density: 4, friction: 0, type: 'liquid', fluidity: 1.0 };
 
 
 materials.set(0, { name: 'void', density: 0 });

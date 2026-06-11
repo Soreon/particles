@@ -224,6 +224,7 @@ out uvec4 outCell;
 
 float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id)  { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
+float fluidOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).b; } // fluidité 0..1
 // Cellule complète : .r = id, .g = vy, .b = vx, .a = flags. Les échanges
 // portent sur la cellule ENTIÈRE : la charge utile suit structurellement
 // sa particule (impossible d'oublier un canal).
@@ -293,7 +294,9 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, bool floor
 
   uint mx = me.b & 0x7Fu;
   if (mx > 0u) {
-    uint fr = (typeOf(me.r) == T_SOLID) ? 2u : 1u;
+    // Friction : solides 2/frame ; liquides selon leur viscosité (les
+    // éclaboussures d'huile meurent vite, celles d'alcool glissent loin).
+    uint fr = (typeOf(me.r) == T_SOLID) ? 2u : ((fluidOf(me.r) < 0.5) ? 2u : 1u);
     mx = (mx > fr) ? (mx - fr) : 0u;
     me.b = (mx > 0u) ? ((me.b & 0x80u) | mx) : 0u;
   }
@@ -312,7 +315,10 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, bool floor
   if (densOf(belowCell.r) < densOf(me.r)) {
     float j = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x9e3779b9u);
     int dm = uGravity + ((j < 0.33) ? -1 : ((j < 0.66) ? 0 : 1));
-    int cap = (belowCell.r == 0u) ? uSubsteps : max(1, uSubsteps >> 1);
+    // Vitesse terminale par milieu, modulée par la fluidité du porteur.
+    int cap = (belowCell.r == 0u)
+      ? uSubsteps
+      : max(1, int(float(uSubsteps >> 1) * fluidOf(belowCell.r)));
     int mi = clamp(int(m) + dm, 1, cap);
     me.g = uint(mi);
   } else {
@@ -392,10 +398,16 @@ void main() {
   //    symétrique : une particule ÉJECTÉE (vy signé haut) monte dans plus
   //    léger qu'elle — l'arc balistique de l'éclaboussure.
   {
-    bool aFall = da > dc && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub);
+    // Gate de porteur visqueux : tomber DANS un liquide passe aussi le filtre
+    // de sa fluidité — vitesses effectives fractionnaires (< 1 case/frame dans
+    // l'huile), impossibles via vy seul (plancher à 1 + taxe d'alignement).
+    float hashC = hashSeeded(corner, floatBitsToUint(uSeed) ^ 0x68bc21ebu);
+    bool carrierOkC = c.r == 0u || typeOf(c.r) != T_LIQUID || hashC < fluidOf(c.r);
+    bool carrierOkD = d.r == 0u || typeOf(d.r) != T_LIQUID || hashC < fluidOf(d.r);
+    bool aFall = da > dc && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub) && carrierOkC;
     bool cRise = (c.g & 0x80u) != 0u && dc > da && bres(c.g & 0x7Fu, uFrameSub);
     if (aFall || cRise) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
-    bool bFall = db > dd && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub);
+    bool bFall = db > dd && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub) && carrierOkD;
     bool dRise = (d.g & 0x80u) != 0u && dd > db && bres(d.g & 0x7Fu, uFrameSub);
     if (bFall || dRise) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
   }
@@ -406,12 +418,17 @@ void main() {
   //    mouvant — sinon les avalanches diagonales en escalier descendent un
   //    tas immergé à pleine cadence, comme dans du vide. Les particules en
   //    ascension balistique en sont exclues.
+  //    Viscosité : les liquides glissent en diagonale à leur fluidité (l'huile
+  //    avale ses pentes lentement, en cohérence avec son nivellement).
+  float hashV = hashSeeded(corner, floatBitsToUint(uSeed) ^ 0x2545f491u);
+  bool viscOkA = typeOf(a.r) != T_LIQUID || hashV < fluidOf(a.r);
+  bool viscOkB = typeOf(b.r) != T_LIQUID || hashV < fluidOf(b.r);
   if (rnd < 0.5) {
-    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
-    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
   } else {
-    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
   }
 
   // (L'étalement horizontal des liquides est traité par une passe dédiée, FLOW_FS.)
@@ -469,13 +486,17 @@ uvec4 fetchCell(ivec2 p) { return texelFetch(uState, p, 0); }
 
 // Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
 // contrairement à sin() dont la réduction d'argument dépend du driver.
-float hash(ivec2 p) {
-  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + floatBitsToUint(uSeed);
+float hashSeeded(ivec2 p, uint seed) {
+  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + seed;
   h ^= h >> 16u;
   h *= 2654435769u;
   h ^= h >> 16u;
   return float(h) * (1.0 / 4294967296.0);
 }
+float hash(ivec2 p)  { return hashSeeded(p, floatBitsToUint(uSeed)); }
+float hash3(ivec2 p) { return hashSeeded(p, floatBitsToUint(uSeed) ^ 0x7f4a7c15u); }
+
+float fluidOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).b; } // fluidité 0..1
 
 // Échéancier de Bresenham (identique à SIM_FS) pour les mouvements vx.
 bool bres(uint m, int s) {
@@ -548,10 +569,11 @@ void main() {
   //    vide ainsi par le bas pendant que le vide sort par le haut.
   if (!doSwap && lLiq && R.r == 0u && blockedBelow(lp) && openAbove(rp)
       && (openAbove(lp) || blockedBelow(rp))) {
-    doSwap = true;
+    // Viscosité : l'étalement se fait à la fluidité du liquide mouvant.
+    doSwap = hash3(ivec2(cornerX, cell.y)) < fluidOf(L.r);
   } else if (!doSwap && rLiq && L.r == 0u && blockedBelow(rp) && openAbove(lp)
       && (openAbove(rp) || blockedBelow(lp))) {
-    doSwap = true;
+    doSwap = hash3(ivec2(cornerX, cell.y)) < fluidOf(R.r);
   } else if (!doSwap && lLiq && rLiq && dL != dR) {
     // B. Relaxation des interfaces liquide-liquide POSÉES, par scan de hauteur.
     ivec2 denseP = (dL > dR) ? lp : rp;
@@ -597,8 +619,11 @@ void main() {
         else break;
       }
 
-      if (hUp + hDown >= 2) doSwap = true;              // poussée déterministe
-      else doSwap = hash(ivec2(cornerX, cell.y)) < 0.5; // diffusion symétrique
+      // Viscosité : cadences modulées par la fluidité minimale de la paire.
+      // La poussée est RALENTIE, jamais nulle (les 45° restent à casser).
+      float fmin = min(fluidOf(L.r), fluidOf(R.r));
+      if (hUp + hDown >= 2) doSwap = hash3(ivec2(cornerX, cell.y)) < max(0.3, fmin);
+      else doSwap = hash(ivec2(cornerX, cell.y)) < 0.5 * fmin; // diffusion modulée
     }
   }
 
