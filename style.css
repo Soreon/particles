@@ -3,7 +3,7 @@
   src: url(pixel.ttf);
 }
 
-canvas {
+#canvas {
     width: 800px;
     height: 800px;
     image-rendering: -moz-crisp-edges;
@@ -12,6 +12,58 @@ canvas {
     image-rendering: crisp-edges;
     cursor: none;
     border: 1px solid #EEE;
+}
+
+/* --- Barre d'outils pixel art --- */
+
+#toolbar {
+  width: 800px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 0;
+}
+
+.toolBtn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 5px 2px;
+  background: #1a1a20;
+  border: 2px solid #3a3a44;
+  border-radius: 0; /* pixel art : angles durs */
+  cursor: pointer;
+  user-select: none;
+  font-family: pixel;
+  font-size: 8px;
+  color: #9a9aa4;
+  box-shadow: 1px 1px 0 #000; /* relief 8-bit */
+}
+
+.toolBtn:hover {
+  border-color: #6a6a78;
+  color: #d0d0d8;
+}
+
+.toolBtn:active {
+  transform: translate(1px, 1px);
+  box-shadow: 0 0 0 #000;
+}
+
+.toolBtn.selected {
+  border-color: #ffd000;
+  background: #2a2a16;
+  color: #fff;
+  box-shadow: 1px 1px 0 #000, 0 0 0 1px #806800 inset;
+}
+
+.toolBtn canvas {
+  width: 20px;
+  height: 20px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  border: 1px solid #000;
 }
 
 body {

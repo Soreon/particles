@@ -129,11 +129,73 @@ function setDebugData(counts) {
   }
 }
 
+// --- Barre d'outils pixel art : un bouton par matériau, avec un échantillon
+// dessiné à partir des VRAIES variantes de couleurs (mini-canvas 12x12 agrandi
+// en pixelated). Le feu scintille en redessinant son échantillon. ---
+
+const toolbarElement = document.getElementById('toolbar');
+const toolButtons = {};
+
+function drawSwatch(swatch, name, toolIds) {
+  const ctx = swatch.getContext('2d');
+  const n = swatch.width;
+  if (name === 'void') {
+    // gomme : fond sombre + diagonale grise
+    ctx.fillStyle = '#101014';
+    ctx.fillRect(0, 0, n, n);
+    ctx.fillStyle = '#55555f';
+    for (let i = 2; i < n - 2; i++) ctx.fillRect(i, n - 1 - i, 1, 1);
+    return;
+  }
+  const ids = toolIds[name];
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const id = ids[(Math.random() * ids.length) | 0];
+      ctx.fillStyle = materials.get(id).color;
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+}
+
+function selectTool(name) {
+  mouse.tool = name;
+  toolElement.textContent = name;
+  for (const t of Object.keys(toolButtons)) {
+    toolButtons[t].classList.toggle('selected', t === name);
+  }
+}
+
+function initializeToolbar(toolIds) {
+  for (const name of tools) {
+    const btn = document.createElement('div');
+    btn.className = 'toolBtn';
+    btn.title = name;
+
+    const swatch = document.createElement('canvas');
+    swatch.width = 10;
+    swatch.height = 10;
+    drawSwatch(swatch, name, toolIds);
+    btn.appendChild(swatch);
+
+    const label = document.createElement('span');
+    label.textContent = name;
+    btn.appendChild(label);
+
+    btn.addEventListener('click', () => selectTool(name));
+    toolbarElement.appendChild(btn);
+    toolButtons[name] = btn;
+
+    // le feu vacille : son échantillon est redessiné en continu
+    if (name === 'fire') setInterval(() => drawSwatch(swatch, 'fire', toolIds), 280);
+  }
+}
+
 // --- Démarrage ---
 
 const { palette, props } = buildLookupTables();
 const toolIds = buildToolIds();
 initializeDebugElements(toolIds);
+initializeToolbar(toolIds);
 
 // clientWidth/clientLeft excluent la bordure 1px du canvas (rect.width = 802) :
 // sans ça, le pinceau dérive de 1-2 cases au bord droit/bas aux grandes grilles.
@@ -156,7 +218,7 @@ gpuWorker.postMessage(['initialize', {
   toolIds,
 }], [offscreen, palette.buffer, props.buffer]);
 
-toolElement.textContent = mouse.tool;
+selectTool(mouse.tool);
 
 // --- Conversion coordonnées écran -> cases de la grille ---
 
@@ -178,18 +240,13 @@ canvasElement.addEventListener('mouseleave', () => {
   mouse.gridX = -1;
   mouse.gridY = -1;
 });
+// La sélection de matériau se fait par les boutons de la barre d'outils ;
+// la molette règle la taille du pinceau (avec ou sans CTRL).
 canvasElement.addEventListener('wheel', (e) => {
-  if (e.ctrlKey) {
-    e.preventDefault();
-    toolNotch += e.deltaY > 0 ? -1 : 1;
-    toolNotch = Math.max(1, Math.min(MAX_TOOL_NOTCH, toolNotch));
-    mouse.toolSize = toolNotch * toolSizeUnit;
-  } else {
-    let index = tools.indexOf(mouse.tool) + (e.deltaY > 0 ? 1 : -1);
-    index = (index + tools.length) % tools.length;
-    mouse.tool = tools[index];
-    toolElement.textContent = mouse.tool;
-  }
+  e.preventDefault();
+  toolNotch += e.deltaY > 0 ? -1 : 1;
+  toolNotch = Math.max(1, Math.min(MAX_TOOL_NOTCH, toolNotch));
+  mouse.toolSize = toolNotch * toolSizeUnit;
 }, { passive: false });
 
 // Touche V : cycle des vues de debug du rendu (normal -> vy -> vx -> flags).
