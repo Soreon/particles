@@ -8,8 +8,10 @@
 // la transforme en couleurs via une palette, le tout upscalé gratuitement par le
 // GPU (canvas en résolution grille, agrandi en CSS avec image-rendering: pixelated).
 //
-// Phase 1 : la passe de simulation est l'identité (copie). On valide ainsi le
-// pipeline (textures, ping-pong, rendu, pinceau) avant d'écrire la vraie physique.
+// Physique : passe de gravité (automate de Margolus, blocs 2x2) + passe
+// d'écoulement (paires 2x1) — règles validées par la réplique CPU (lab/).
+// Compteurs de particules : readback asynchrone (PBO + fence) toutes les
+// COUNT_INTERVAL frames, sans jamais bloquer le pipeline GPU.
 
 let gl = null;
 let canvas = null;
@@ -59,6 +61,11 @@ let uRenderGrid = null;
 let uRenderMouse = null;
 let uRenderToolSize = null;
 let uRenderDragging = null;
+let uRenderRingHalfWidth = null;
+// Demi-épaisseur de l'anneau du curseur, en texels : proportionnelle à la
+// résolution pour rester visible à l'écran, min 0.75 pour éviter les trous
+// (la distance max cercle->centre de cellule est ~0.707).
+let ringHalfWidth = 0.75;
 
 // Tampon CPU réutilisé pour estampiller le pinceau (taille max d'un disque r<=8).
 let brushPatch = new Uint8Array(1);
@@ -72,6 +79,18 @@ let toolIds = {};
 // --- Mesure FPS ---
 let frameCount = 0;
 let lastFpsTime = 0;
+
+// --- Comptage des particules (readback asynchrone PBO, jamais bloquant) ---
+const COUNT_INTERVAL = 30; // frames entre deux lancements de readback
+let frameIndex = 0;
+let countPbo = null;
+let countSync = null;
+let countArray = null;  // Uint8Array (lecture compacte) ou Uint32Array (repli RGBA)
+let countStep = 1;      // éléments de countArray par texel
+let countFormat = 0;
+let countType = 0;
+let bucketOf = null;    // id de matériau -> index de compteur + 1 (0 = ignorer)
+let bucketNames = [];   // index de compteur -> nom du matériau
 
 // ---------------------------------------------------------------------------
 // Helpers WebGL
@@ -183,8 +202,14 @@ float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id)  { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
 uint fetch(ivec2 p)   { return texelFetch(uState, p, 0).r; }
 
+// Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
+// contrairement à sin() dont la réduction d'argument dépend du driver.
 float hash(ivec2 p) {
-  return fract(sin(dot(vec2(p), vec2(127.1, 311.7)) + uSeed) * 43758.5453);
+  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + floatBitsToUint(uSeed);
+  h ^= h >> 16u;
+  h *= 2654435769u;
+  h ^= h >> 16u;
+  return float(h) * (1.0 / 4294967296.0);
 }
 
 void main() {
@@ -270,8 +295,14 @@ float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id) { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
 uint fetch(ivec2 p)  { return texelFetch(uState, p, 0).r; }
 
+// Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
+// contrairement à sin() dont la réduction d'argument dépend du driver.
 float hash(ivec2 p) {
-  return fract(sin(dot(vec2(p), vec2(127.1, 311.7)) + uSeed) * 43758.5453);
+  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + floatBitsToUint(uSeed);
+  h ^= h >> 16u;
+  h *= 2654435769u;
+  h ^= h >> 16u;
+  return float(h) * (1.0 / 4294967296.0);
 }
 
 // Densité avec gardes verticales : au-dessus de la grille = vide (0.0),
@@ -395,6 +426,7 @@ uniform ivec2 uGrid;
 uniform vec2 uMouse;     // position souris en cases (-1 si hors canvas)
 uniform int uToolSize;   // 1 = un point, >1 = anneau de rayon (toolSize-1)
 uniform int uDragging;
+uniform float uRingHalfWidth; // demi-épaisseur de l'anneau, en texels
 
 out vec4 fragColor;
 
@@ -418,7 +450,7 @@ void main() {
     float r = float(uToolSize - 1);
     bool onCursor = (uToolSize == 1)
       ? (cell.x == int(uMouse.x) && cell.y == int(uMouse.y))
-      : (abs(dist - r) < 0.6);
+      : (abs(dist - r) < uRingHalfWidth);
     if (onCursor) {
       color = vec3(1.0); // curseur blanc, visible sur le fond sombre
     }
@@ -538,7 +570,87 @@ function render() {
   gl.uniform2f(uRenderMouse, mouse.x, mouse.y);
   gl.uniform1i(uRenderToolSize, mouse.toolSize);
   gl.uniform1i(uRenderDragging, mouse.dragging ? 1 : 0);
+  gl.uniform1f(uRenderRingHalfWidth, ringHalfWidth);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Prépare le comptage : table id -> compteur, et PBO de readback. Le format de
+// lecture compact (RED_INTEGER + UNSIGNED_BYTE) n'est pas garanti par la spec
+// pour un framebuffer entier — on le sonde, sinon repli sur la combinaison
+// garantie RGBA_INTEGER + UNSIGNED_INT (4 entiers par texel, on lit le canal R).
+function initCounting() {
+  bucketOf = new Uint8Array(256);
+  bucketNames = Object.keys(toolIds).filter((n) => n !== 'void');
+  bucketNames.forEach((name, i) => {
+    for (const id of toolIds[name]) bucketOf[id] = i + 1;
+  });
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, stateFbo[0]);
+  const f = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT);
+  const t = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE);
+  const texels = gridWidth * gridHeight;
+  if (f === gl.RED_INTEGER && t === gl.UNSIGNED_BYTE) {
+    countFormat = gl.RED_INTEGER;
+    countType = gl.UNSIGNED_BYTE;
+    countArray = new Uint8Array(texels);
+    countStep = 1;
+  } else {
+    countFormat = gl.RGBA_INTEGER;
+    countType = gl.UNSIGNED_INT;
+    countArray = new Uint32Array(texels * 4);
+    countStep = 4;
+  }
+  countPbo = gl.createBuffer();
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, countPbo);
+  gl.bufferData(gl.PIXEL_PACK_BUFFER, countArray.byteLength, gl.STREAM_READ);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // Lignes serrées dans le PBO quelle que soit la largeur de grille
+  // (PACK_ALIGNMENT vaut 4 par défaut → padding si largeur non multiple de 4).
+  gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+}
+
+// Une frame sur COUNT_INTERVAL : lance un readPixels asynchrone vers le PBO,
+// borné par une fence. Les frames suivantes : si la fence est signalée, on lit
+// le PBO (transfert mémoire pur, le GPU a déjà fini) et on compte côté CPU.
+function updateCounts() {
+  if (countSync !== null) {
+    const status = gl.clientWaitSync(countSync, 0, 0);
+    if (status === gl.WAIT_FAILED) {
+      // Perte de contexte ou erreur : on jette la fence pour pouvoir relancer.
+      gl.deleteSync(countSync);
+      countSync = null;
+      return;
+    }
+    if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+      gl.deleteSync(countSync);
+      countSync = null;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, countPbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, countArray);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+
+      const bucketCounts = new Uint32Array(bucketNames.length + 1);
+      const n = gridWidth * gridHeight;
+      const step = countStep;
+      for (let i = 0; i < n; i++) {
+        bucketCounts[bucketOf[countArray[i * step] & 0xFF]]++;
+      }
+      const counts = {};
+      for (let i = 0; i < bucketNames.length; i++) counts[bucketNames[i]] = bucketCounts[i + 1];
+      postMessage(['debugData', counts]);
+    }
+  } else if (frameIndex % COUNT_INTERVAL === 0) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, stateFbo[current]);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, countPbo);
+    gl.readPixels(0, 0, gridWidth, gridHeight, countFormat, countType, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    countSync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    // Garantit la soumission de la fence au serveur GL (sans flush, elle peut ne
+    // jamais se signaler si rien d'autre ne pousse le flux de commandes).
+    gl.flush();
+  }
 }
 
 function frame(now) {
@@ -552,6 +664,9 @@ function frame(now) {
     }
   }
   render();
+
+  frameIndex++;
+  updateCounts();
 
   frameCount++;
   if (now - lastFpsTime >= 1000) {
@@ -572,6 +687,7 @@ function initialize(opts) {
   gridWidth = opts.gridWidth;
   gridHeight = opts.gridHeight;
   toolIds = opts.toolIds;
+  if (opts.substepsPerFrame) substepsPerFrame = opts.substepsPerFrame;
 
   canvas.width = gridWidth;
   canvas.height = gridHeight;
@@ -606,11 +722,16 @@ function initialize(opts) {
   uRenderMouse = gl.getUniformLocation(renderProgram, 'uMouse');
   uRenderToolSize = gl.getUniformLocation(renderProgram, 'uToolSize');
   uRenderDragging = gl.getUniformLocation(renderProgram, 'uDragging');
+  uRenderRingHalfWidth = gl.getUniformLocation(renderProgram, 'uRingHalfWidth');
+  ringHalfWidth = Math.max(0.75, 0.6 * (gridWidth / 160));
 
-  // Textures d'état (initialisées à zéro = vide).
-  const zero = new Uint8Array(gridWidth * gridHeight);
-  stateTex[0] = createStateTexture(zero);
-  stateTex[1] = createStateTexture(zero);
+  // Lignes serrées pour tous les uploads (UNPACK_ALIGNMENT vaut 4 par défaut :
+  // une largeur non multiple de 4 ferait échouer texImage2D → worker mort).
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+  // Textures d'état (data null : WebGL2 garantit l'initialisation à zéro = vide).
+  stateTex[0] = createStateTexture(null);
+  stateTex[1] = createStateTexture(null);
   stateFbo[0] = createFbo(stateTex[0]);
   stateFbo[1] = createFbo(stateTex[1]);
   current = 0;
@@ -621,8 +742,10 @@ function initialize(opts) {
   // VAO vide requis pour drawArrays sans attributs en WebGL2.
   gl.bindVertexArray(gl.createVertexArray());
 
+  initCounting();
+
   console.log('GPU worker initialisé (WebGL2)');
-  console.log(`Grille : ${gridWidth}x${gridHeight}`);
+  console.log(`Grille : ${gridWidth}x${gridHeight}, ${substepsPerFrame} sous-pas/frame`);
 
   requestAnimationFrame(frame);
 }

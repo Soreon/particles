@@ -6,15 +6,36 @@
 // GPU, construit les tables de lookup (palette de couleurs + propriétés des
 // matériaux) à partir de materials.js, et relaie les entrées souris/molette.
 // Toute la simulation et le rendu vivent dans gpu.worker.js (WebGL2).
+//
+// La taille de grille se choisit via l'URL : ?grid=320 (défaut), 640, 800…
+// La vitesse de chute et la taille du pinceau sont proportionnelles à la
+// résolution, pour garder le même rendu À L'ÉCRAN qu'à 160x160.
 
 import materials from './materials.js';
 
 const canvasElement = document.getElementById('canvas');
 const toolElement = document.getElementById('tool');
+const debugElement = document.getElementById('debug');
 const fpsElement = document.getElementById('fps-value');
 
-const gridWidth = 160;
-const gridHeight = 160;
+const urlParams = new URLSearchParams(window.location.search);
+// Clamp [32, 2048] (MAX_TEXTURE_SIZE garanti >= 2048 en WebGL2) et arrondi au
+// multiple de 4 : valeurs négatives/énormes/farfelues -> échec opaque sinon.
+const requestedGrid = parseInt(urlParams.get('grid'), 10) || 320;
+const gridSize = Math.round(Math.min(2048, Math.max(32, requestedGrid)) / 4) * 4;
+const gridWidth = gridSize;
+const gridHeight = gridSize;
+
+// La gravité fait tomber d'une case par sous-pas : on scale les sous-pas avec
+// la grille pour une vitesse visuelle ~constante (8 sous-pas à 160).
+const substepsPerFrame = Math.max(4, Math.round(8 * (gridSize / 160)));
+
+// Pinceau : 5 crans, chacun proportionnel à la résolution. On stocke le CRAN
+// (1..5) et on calcule la taille en cases — un clamp sur la taille ferait
+// dériver les valeurs hors de la grille des crans après une butée.
+const toolSizeUnit = Math.max(1, Math.round(gridSize / 160));
+const MAX_TOOL_NOTCH = 5;
+let toolNotch = 3;
 
 const tools = ['void', 'water', 'sand', 'oil', 'alcool'];
 
@@ -25,7 +46,7 @@ const mouse = {
   gridY: -1,
   dragging: false,
   tool: 'sand',
-  toolSize: 3,
+  toolSize: 3 * toolSizeUnit,
 };
 
 // --- Construction des tables de lookup (indexées par id de matériau, 0..255) ---
@@ -66,16 +87,49 @@ function buildToolIds() {
   return map;
 }
 
+// --- Panneau de debug : une ligne par matériau + taille de grille ---
+
+const countElements = {};
+
+function addDebugRow(label) {
+  const row = debugElement.appendChild(document.createElement('div'));
+  row.classList.add('debugRow');
+  const labelEl = row.appendChild(document.createElement('span'));
+  labelEl.classList.add('debugLabel');
+  labelEl.textContent = label.charAt(0).toUpperCase() + label.slice(1) + ': ';
+  const valueEl = row.appendChild(document.createElement('span'));
+  valueEl.classList.add('debugValue');
+  return valueEl;
+}
+
+function initializeDebugElements(toolIds) {
+  addDebugRow('grid').textContent = gridWidth + 'x' + gridHeight;
+  for (const name of Object.keys(toolIds)) {
+    if (name === 'void') continue;
+    countElements[name] = addDebugRow(name);
+    countElements[name].textContent = '0';
+  }
+}
+
+function setDebugData(counts) {
+  for (const name of Object.keys(counts)) {
+    if (countElements[name]) countElements[name].textContent = counts[name];
+  }
+}
+
 // --- Démarrage ---
 
 const { palette, props } = buildLookupTables();
 const toolIds = buildToolIds();
+initializeDebugElements(toolIds);
 
+// clientWidth/clientLeft excluent la bordure 1px du canvas (rect.width = 802) :
+// sans ça, le pinceau dérive de 1-2 cases au bord droit/bas aux grandes grilles.
 const rect = canvasElement.getBoundingClientRect();
-const displayLeft = rect.left;
-const displayTop = rect.top;
-const displayWidth = rect.width;
-const displayHeight = rect.height;
+const displayLeft = rect.left + canvasElement.clientLeft;
+const displayTop = rect.top + canvasElement.clientTop;
+const displayWidth = canvasElement.clientWidth;
+const displayHeight = canvasElement.clientHeight;
 
 const offscreen = canvasElement.transferControlToOffscreen();
 const gpuWorker = new Worker('gpu.worker.js');
@@ -84,6 +138,7 @@ gpuWorker.postMessage(['initialize', {
   canvas: offscreen,
   gridWidth,
   gridHeight,
+  substepsPerFrame,
   palette,
   props,
   toolIds,
@@ -114,8 +169,9 @@ canvasElement.addEventListener('mouseleave', () => {
 canvasElement.addEventListener('wheel', (e) => {
   if (e.ctrlKey) {
     e.preventDefault();
-    mouse.toolSize += e.deltaY > 0 ? -1 : 1;
-    mouse.toolSize = Math.max(1, Math.min(5, mouse.toolSize));
+    toolNotch += e.deltaY > 0 ? -1 : 1;
+    toolNotch = Math.max(1, Math.min(MAX_TOOL_NOTCH, toolNotch));
+    mouse.toolSize = toolNotch * toolSizeUnit;
   } else {
     let index = tools.indexOf(mouse.tool) + (e.deltaY > 0 ? 1 : -1);
     index = (index + tools.length) % tools.length;
@@ -139,6 +195,9 @@ gpuWorker.onmessage = ({ data }) => {
   switch (inst) {
     case 'fps':
       fpsElement.textContent = Math.round(args[0]);
+      break;
+    case 'debugData':
+      setDebugData(args[0]);
       break;
     default:
       break;
