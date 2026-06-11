@@ -263,8 +263,13 @@ function updateGridPosition() {
 // --- Entrées ---
 
 canvasElement.addEventListener('mousedown', () => { mouse.dragging = true; });
-canvasElement.addEventListener('mouseup', () => { mouse.dragging = false; });
+// Relâchement écouté au niveau FENÊTRE : un mouseup hors du canvas (drag qui
+// sort puis lâche) arrête bien le pinceau — sinon il « colle » au retour.
+window.addEventListener('mouseup', () => { mouse.dragging = false; });
 canvasElement.addEventListener('mousemove', (e) => {
+  // Ceinture et bretelles : si le bouton n'est plus réellement enfoncé
+  // (relâché hors de la fenêtre du navigateur), on arrête le drag.
+  if (mouse.dragging && (e.buttons & 1) === 0) mouse.dragging = false;
   mouse.x = e.clientX;
   mouse.y = e.clientY;
   updateGridPosition();
