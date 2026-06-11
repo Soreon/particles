@@ -3,7 +3,17 @@
 // La passe d'écoulement est enfichable (lab/rules/*.js) pour comparer des
 // variantes de règles sur les mêmes scénarios.
 
-const { DENS, TYPE, FLUID, T_SOLID, T_LIQUID, MATERIAL_IDS } = require('./materials');
+const {
+  DENS, TYPE, FLUID, FLAM, MATERIAL_IDS,
+  T_SOLID, T_LIQUID, T_STATIC, T_GAS, T_FIRE,
+} = require('./materials');
+
+// Immobile et indéplaçable : la pierre (barrières) et le feu (état qui brûle
+// sur place — les flammes qui « montent » sont des langues spawnées au-dessus).
+function movable(id) {
+  const t = TYPE[id];
+  return t !== T_STATIC && t !== T_FIRE;
+}
 
 // Hash déterministe -> [0,1) (équivalent du hash() des shaders).
 function hash01(x, y, salt) {
@@ -37,6 +47,7 @@ class Sim {
     const eng = (flowRule && flowRule.engine) || {};
     this.engineVelocity = !!eng.velocity;
     this.engineViscosity = !!eng.viscosity;
+    this.engineTransforms = !!eng.transforms;
     this.G = eng.G || 1;
     this.jitterP = eng.jitterP || 0;
     this.grid = new Uint8Array(w * h);
@@ -116,6 +127,99 @@ class Sim {
     }
   }
 
+  // Transformations (feu/fumée/vapeur/combustion) : chaque cellule décide de
+  // SON propre sort d'après ses voisins lus dans l'instantané pré-frame
+  // (this.next sert de snapshot) — sans conflit, comme les invocations GPU.
+  // Renvoie true si le sort de la cellule est entièrement réglé pour la frame.
+  transformCell(i, x, y, salt) {
+    const { w, h, grid, next, vy, vx, fl } = this;
+    const id = next[i]; // état pré-frame
+    const type = TYPE[id];
+    const up = y > 0 ? next[i - w] : 0;
+    const dn = y + 1 < h ? next[i + w] : 0;
+    const lf = x > 0 ? next[i - 1] : 0;
+    const rt = x + 1 < w ? next[i + 1] : 0;
+    const r1 = hash01(x, y, salt ^ 0x51f15e0d);
+    const r2 = hash01(x, y, salt ^ 0x3c6ef372);
+    const variant = (r2 * 10) | 0;
+
+    // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu.
+    if (id === 0) {
+      if (TYPE[dn] === T_FIRE) {
+        if (r1 < 0.12) {
+          grid[i] = 160 + variant; // langue de flamme, vie courte
+          fl[i] = 4 + ((r2 * 5) | 0);
+          vy[i] = 0; vx[i] = 0;
+          return true;
+        }
+        if (r1 < 0.16) {
+          grid[i] = 170 + variant; // bouffée de fumée
+          fl[i] = 0;
+          vy[i] = 0; vx[i] = 0;
+          return true;
+        }
+      }
+      return false;
+    }
+
+    const nearFire = TYPE[up] === T_FIRE || TYPE[dn] === T_FIRE
+      || TYPE[lf] === T_FIRE || TYPE[rt] === T_FIRE;
+    const isWater = (v) => v >= 110 && v <= 119;
+    const nearWater = isWater(up) || isWater(dn) || isWater(lf) || isWater(rt);
+
+    // Feu : vit sur place, éteint par l'eau, meurt en fumée ou en rien.
+    if (type === T_FIRE) {
+      if (fl[i] === 0) fl[i] = 25 + ((r2 * 30) | 0); // allumage frais
+      if (nearWater && r1 < 0.6) {
+        grid[i] = 170 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        return true;
+      }
+      fl[i]--;
+      if (fl[i] <= 1) {
+        grid[i] = r1 < 0.75 ? 0 : 170 + variant;
+        fl[i] = 0; vy[i] = 0; vx[i] = 0;
+      }
+      return true;
+    }
+
+    // Gaz (fumée/vapeur) : durée de vie, montée, wobble ; la vapeur se
+    // condense (pluie), plus vite sous un plafond.
+    if (type === T_GAS) {
+      const isSteam = id >= 180;
+      if (fl[i] === 0) fl[i] = isSteam ? 100 + ((r2 * 100) | 0) : 70 + ((r2 * 80) | 0);
+      fl[i] -= (y > 0 && up !== 0) ? 3 : 1; // plafond : dissipation/condensation accélérée
+      if (fl[i] <= 1) {
+        if (isSteam && r1 < 0.5) {
+          grid[i] = 110 + variant; // condensation : goutte de pluie
+          fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        } else {
+          grid[i] = 0; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+        }
+        return true;
+      }
+      vy[i] = 0x80 | 2; // poussée d'Archimède permanente
+      if (r1 < 0.3) vx[i] = (r2 < 0.5 ? 0x80 : 0) | 1; // wobble du panache
+      return true;
+    }
+
+    // Combustion : un inflammable au contact du feu s'embrase (durée de vie
+    // de la flamme selon le combustible : alcool bref et vif, bois durable).
+    if (FLAM[id] > 0 && nearFire && r1 < (FLAM[id] / 255) * 0.3) {
+      grid[i] = 160 + variant;
+      fl[i] = 20 + ((255 - FLAM[id]) >> 1) + ((r2 * 10) | 0);
+      vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    // Eau au contact du feu : vaporisation.
+    if (isWater(id) && nearFire && r1 < 0.3) {
+      grid[i] = 180 + variant; fl[i] = 0; vy[i] = 0; vx[i] = 0;
+      return true;
+    }
+
+    return false;
+  }
+
   velocityUpdate(salt) {
     const { w, h, grid, vy, vyN, vx } = this;
     const S = this.substepsPerFrame;
@@ -124,11 +228,14 @@ class Sim {
     // coïncident avec le bon appariement Margolus qu'une frame sur deux).
     const capLiquid = Math.max(1, S >> 1);
     vyN.set(vy); // instantané pré-mise-à-jour
+    if (this.engineTransforms) this.next.set(grid); // snapshot ids pré-frame
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
+        if (this.engineTransforms && this.transformCell(i, x, y, salt)) continue;
         const id = grid[i];
         if (id === 0) { vy[i] = 0; vx[i] = 0; continue; }
+        if (TYPE[id] === T_STATIC) { vy[i] = 0; vx[i] = 0; continue; }
 
         // Friction latérale (une fois par frame) : les solides s'arrêtent vite,
         // les liquides glissent. vx n'est jamais entretenu (pas de fossile).
@@ -208,9 +315,9 @@ class Sim {
         if (ev && this.jitterP > 0) {
           const jit = hash01(x0, y0, salt ^ 0x5bd1e995);
           if (jit < this.jitterP) {
-            if (da > dd && dc > dd && (vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame)) {
+            if (da > dd && dc > dd && movable(a) && movable(d) && !(TYPE[a] === T_SOLID && TYPE[d] === T_SOLID) && (vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame)) {
               t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t;
-            } else if (db > dc && dd > dc && (vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame)) {
+            } else if (db > dc && dd > dc && movable(b) && movable(c) && !(TYPE[b] === T_SOLID && TYPE[c] === T_SOLID) && (vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame)) {
               t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t;
             }
           }
@@ -228,13 +335,17 @@ class Sim {
           const hashC = this.engineViscosity ? hash01(x0, y0, salt ^ 0x68bc21eb) : 0;
           const carrierOk = (target) => !this.engineViscosity || target === 0
             || TYPE[target] !== T_LIQUID || hashC < FLUID[target] / 255;
-          const aFall = da > dc && (!ev || ((vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame))) && carrierOk(c);
-          const cRise = ev && (vy[oc] & 0x80) !== 0 && dc > da && this.bres(vy[oc] & 0x7F, sFrame);
+          // Paires échangeables : ni pierre ni feu (immobiles/indéplaçables),
+          // et jamais solide-à-travers-solide (le sable ne percole pas le bois).
+          const pairOk = (m, n) => movable(m) && movable(n)
+            && !(TYPE[m] === T_SOLID && TYPE[n] === T_SOLID);
+          const aFall = da > dc && pairOk(a, c) && (!ev || ((vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame))) && carrierOk(c);
+          const cRise = ev && (vy[oc] & 0x80) !== 0 && dc > da && pairOk(c, a) && this.bres(vy[oc] & 0x7F, sFrame);
           if (aFall || cRise) {
             t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t;
           }
-          const bFall = db > dd && (!ev || ((vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame))) && carrierOk(d);
-          const dRise = ev && (vy[od] & 0x80) !== 0 && dd > db && this.bres(vy[od] & 0x7F, sFrame);
+          const bFall = db > dd && pairOk(b, d) && (!ev || ((vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame))) && carrierOk(d);
+          const dRise = ev && (vy[od] & 0x80) !== 0 && dd > db && pairOk(d, b) && this.bres(vy[od] & 0x7F, sFrame);
           if (bFall || dRise) {
             t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
           }
@@ -250,12 +361,14 @@ class Sim {
         //  l'huile avale ses pentes lentement, en cohérence avec son nivellement)
         const hashV = this.engineViscosity ? hash01(x0, y0, salt ^ 0x2545f491) : 0;
         const gA = () => {
+          if (ev && !(movable(a) && movable(d) && !(TYPE[a] === T_SOLID && TYPE[d] === T_SOLID))) return false;
           if (!ev) return true;
           if ((vy[oa] & 0x80) !== 0) return false;
           if (this.engineViscosity && TYPE[a] === T_LIQUID && hashV >= FLUID[a] / 255) return false;
           return d === 0 || this.bres(vy[oa] & 0x7F, sFrame);
         };
         const gB = () => {
+          if (ev && !(movable(b) && movable(c) && !(TYPE[b] === T_SOLID && TYPE[c] === T_SOLID))) return false;
           if (!ev) return true;
           if ((vy[ob] & 0x80) !== 0) return false;
           if (this.engineViscosity && TYPE[b] === T_LIQUID && hashV >= FLUID[b] / 255) return false;

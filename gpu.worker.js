@@ -254,6 +254,21 @@ bool bres(uint m, int s) {
 
 const uint T_SOLID = 1u;
 const uint T_LIQUID = 2u;
+const uint T_STATIC = 3u; // immobile et indéplaçable (pierre)
+const uint T_GAS = 4u;    // monte, ondule, durée de vie (fumée, vapeur)
+const uint T_FIRE = 5u;   // brûle sur place, embrase ses voisins, durée de vie
+
+float flamOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).a; } // inflammabilité 0..1
+bool isWaterId(uint id) { return id >= 110u && id <= 119u; }
+
+// Pierre et feu : ni mouvants ni déplaçables ; et jamais de solide à travers
+// un solide (le sable se pose SUR le bois au lieu de percoler).
+bool pairOk(uint idA, uint idB) {
+  uint ta = typeOf(idA);
+  uint tb = typeOf(idB);
+  if (ta == T_STATIC || ta == T_FIRE || tb == T_STATIC || tb == T_FIRE) return false;
+  return !(ta == T_SOLID && tb == T_SOLID);
+}
 
 // Impact (transition transit -> posé) : conversion de la vitesse d'arrivée m.
 // Liquides : éclaboussure — éjection balistique (vy signé haut + vx latéral)
@@ -282,15 +297,82 @@ uvec4 impact(uvec4 me, ivec2 pos, uint m, bool airAbove) {
   return me;
 }
 
-// Mise à jour de la vélocité (une fois par frame, au sous-pas 0). Cycle de vie :
-//   - friction vx (jamais entretenu : pas de vitesse fossile) ;
-//   - montée balistique (gouttes éjectées) : décélération G, retombée à l'apex ;
-//   - peut tomber : vy += G ± 1 (gravité stochastique), plafond S dans le vide,
-//     S/2 dans un liquide porteur (vitesse terminale par milieu) ;
-//   - bloquée : file d'attente (vy := min) sur cible mobile, IMPACT sur posée.
-// belowCell/aboveCell : cellules PRÉ-mise-à-jour ; floorBelow : sous la grille.
-uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, bool floorBelow, bool topAbove) {
-  if (me.r == 0u) { me.g = 0u; me.b = 0u; return me; }
+// Mise à jour de la vélocité ET transformations (une fois par frame, sous-pas 0).
+// Transformations (chaque cellule décide de SON sort sur l'état pré-frame) :
+//   - vide au-dessus d'un feu : langues de flammes / bouffées de fumée ;
+//   - feu : vit sur place, éteint par l'eau (fumée), meurt (vide/fumée) ;
+//   - gaz : montée permanente + wobble, durée de vie ; la vapeur se condense
+//     en pluie (plus vite sous un plafond) ;
+//   - inflammable au contact du feu : s'embrase (vie de flamme selon le
+//     combustible) ; eau au contact du feu : se vaporise.
+// Cycle de vie vélocité (inchangé) :
+//   - friction vx ; montée balistique ; chute (gravité stochastique, vitesse
+//     terminale par milieu/fluidité) ; file d'attente / impact.
+// Les cellules voisines sont PRÉ-mise-à-jour ; durée de vie dans .a.
+uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, uvec4 lfCell, uvec4 rtCell, bool floorBelow, bool topAbove) {
+  float r1 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x51f15e0du);
+  float r2 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x3c6ef372u);
+  uint variant = uint(r2 * 10.0);
+
+  // Vide : langues de flammes et fumée naissent AU-DESSUS d'un feu.
+  if (me.r == 0u) {
+    if (!floorBelow && typeOf(belowCell.r) == T_FIRE) {
+      if (r1 < 0.12) return uvec4(160u + variant, 0u, 0u, 4u + uint(r2 * 5.0));
+      if (r1 < 0.16) return uvec4(170u + variant, 0u, 0u, 0u);
+    }
+    return uvec4(0u);
+  }
+
+  uint myType = typeOf(me.r);
+
+  bool nearFire = typeOf(belowCell.r) == T_FIRE || (!topAbove && typeOf(aboveCell.r) == T_FIRE)
+    || typeOf(lfCell.r) == T_FIRE || typeOf(rtCell.r) == T_FIRE;
+  bool nearWater = isWaterId(belowCell.r) || isWaterId(aboveCell.r)
+    || isWaterId(lfCell.r) || isWaterId(rtCell.r);
+
+  // Feu : vit sur place, éteint par l'eau, meurt en fumée ou en rien.
+  if (myType == T_FIRE) {
+    uint life = me.a;
+    if (life == 0u) life = 25u + uint(r2 * 30.0);
+    if (nearWater && r1 < 0.6) return uvec4(170u + variant, 0u, 0u, 0u);
+    life--;
+    if (life <= 1u) {
+      return (r1 < 0.75) ? uvec4(0u) : uvec4(170u + variant, 0u, 0u, 0u);
+    }
+    return uvec4(me.r, 0u, 0u, life);
+  }
+
+  // Gaz : durée de vie, montée permanente, wobble ; condensation de la vapeur.
+  if (myType == T_GAS) {
+    bool isSteam = me.r >= 180u;
+    uint life = me.a;
+    if (life == 0u) life = isSteam ? (100u + uint(r2 * 100.0)) : (70u + uint(r2 * 80.0));
+    uint decay = (!topAbove && aboveCell.r != 0u) ? 3u : 1u; // plafond : plus vite
+    life = (life > decay) ? (life - decay) : 0u;
+    if (life <= 1u) {
+      if (isSteam && r1 < 0.5) return uvec4(110u + variant, 0u, 0u, 0u); // pluie
+      return uvec4(0u);
+    }
+    uint wob = (r1 < 0.3) ? (((r2 < 0.5) ? 0x80u : 0u) | 1u) : 0u;
+    return uvec4(me.r, 0x80u | 2u, wob, life);
+  }
+
+  // Combustion : un inflammable au contact du feu s'embrase (vie de flamme
+  // selon le combustible : alcool bref et vif, bois durable).
+  float flam = flamOf(me.r);
+  if (flam > 0.0 && nearFire && r1 < flam * 0.3) {
+    uint life = 20u + ((255u - uint(flam * 255.0)) >> 1) + uint(r2 * 10.0);
+    return uvec4(160u + variant, 0u, 0u, life);
+  }
+
+  // Eau au contact du feu : vaporisation.
+  if (isWaterId(me.r) && nearFire && r1 < 0.3) {
+    return uvec4(180u + variant, 0u, 0u, 0u);
+  }
+
+  // Statique (pierre, bois non embrasé) : immobile, charge utile nulle.
+  // APRÈS les tests d'inflammabilité — le bois statique doit pouvoir brûler.
+  if (myType == T_STATIC) { me.g = 0u; me.b = 0u; return me; }
 
   uint mx = me.b & 0x7Fu;
   if (mx > 0u) {
@@ -344,7 +426,9 @@ void main() {
       bool topB = cell.y - 1 < 0;
       uvec4 below = floorB ? uvec4(0u) : fetchCell(cell + ivec2(0, 1));
       uvec4 above = topB ? uvec4(0u) : fetchCell(cell + ivec2(0, -1));
-      me = updateVy(me, cell, below, above, floorB, topB);
+      uvec4 lf = (cell.x - 1 < 0) ? uvec4(0u) : fetchCell(cell + ivec2(-1, 0));
+      uvec4 rt = (cell.x + 1 >= uGrid.x) ? uvec4(0u) : fetchCell(cell + ivec2(1, 0));
+      me = updateVy(me, cell, below, above, lf, rt, floorB, topB);
     }
     outCell = me;
     return;
@@ -362,16 +446,24 @@ void main() {
   if (uFrameSub == 0) {
     bool floorBelow = corner.y + 2 >= uGrid.y;
     bool topAbove = corner.y - 1 < 0;
+    bool leftEdge = corner.x - 1 < 0;
+    bool rightEdge = corner.x + 2 >= uGrid.x;
     uvec4 belowC = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(0, 2));
     uvec4 belowD = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(1, 2));
     uvec4 aboveA = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(0, -1));
     uvec4 aboveB = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(1, -1));
-    uvec4 a2 = updateVy(a, corner, c, aboveA, false, topAbove);
-    uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, aboveB, false, topAbove);
-    c = updateVy(c, corner + ivec2(0, 1), belowC, a, floorBelow, false);
-    d = updateVy(d, corner + ivec2(1, 1), belowD, b, floorBelow, false);
+    uvec4 lfA = leftEdge ? uvec4(0u) : fetchCell(corner + ivec2(-1, 0));
+    uvec4 lfC = leftEdge ? uvec4(0u) : fetchCell(corner + ivec2(-1, 1));
+    uvec4 rtB = rightEdge ? uvec4(0u) : fetchCell(corner + ivec2(2, 0));
+    uvec4 rtD = rightEdge ? uvec4(0u) : fetchCell(corner + ivec2(2, 1));
+    uvec4 a2 = updateVy(a, corner, c, aboveA, lfA, b, false, topAbove);
+    uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, aboveB, a, rtB, false, topAbove);
+    uvec4 c2 = updateVy(c, corner + ivec2(0, 1), belowC, a, lfC, d, floorBelow, false);
+    uvec4 d2 = updateVy(d, corner + ivec2(1, 1), belowD, b, c, rtD, floorBelow, false);
     a = a2;
     b = b2;
+    c = c2;
+    d = d2;
   }
 
   float da = densOf(a.r), db = densOf(b.r), dc = densOf(c.r), dd = densOf(d.r);
@@ -385,9 +477,9 @@ void main() {
   if (uJitterP > 0.0) {
     float jit = hash2(corner);
     if (jit < uJitterP) {
-      if (da > dd && dc > dd && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub)) {
+      if (da > dd && dc > dd && pairOk(a.r, d.r) && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub)) {
         t = a; a = d; d = t; td = da; da = dd; dd = td;
-      } else if (db > dc && dd > dc && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub)) {
+      } else if (db > dc && dd > dc && pairOk(b.r, c.r) && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub)) {
         t = b; b = c; c = t; td = db; db = dc; dc = td;
       }
     }
@@ -404,11 +496,11 @@ void main() {
     float hashC = hashSeeded(corner, floatBitsToUint(uSeed) ^ 0x68bc21ebu);
     bool carrierOkC = c.r == 0u || typeOf(c.r) != T_LIQUID || hashC < fluidOf(c.r);
     bool carrierOkD = d.r == 0u || typeOf(d.r) != T_LIQUID || hashC < fluidOf(d.r);
-    bool aFall = da > dc && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub) && carrierOkC;
-    bool cRise = (c.g & 0x80u) != 0u && dc > da && bres(c.g & 0x7Fu, uFrameSub);
+    bool aFall = da > dc && pairOk(a.r, c.r) && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub) && carrierOkC;
+    bool cRise = (c.g & 0x80u) != 0u && dc > da && pairOk(c.r, a.r) && bres(c.g & 0x7Fu, uFrameSub);
     if (aFall || cRise) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
-    bool bFall = db > dd && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub) && carrierOkD;
-    bool dRise = (d.g & 0x80u) != 0u && dd > db && bres(d.g & 0x7Fu, uFrameSub);
+    bool bFall = db > dd && pairOk(b.r, d.r) && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub) && carrierOkD;
+    bool dRise = (d.g & 0x80u) != 0u && dd > db && pairOk(d.r, b.r) && bres(d.g & 0x7Fu, uFrameSub);
     if (bFall || dRise) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
   }
 
@@ -424,11 +516,11 @@ void main() {
   bool viscOkA = typeOf(a.r) != T_LIQUID || hashV < fluidOf(a.r);
   bool viscOkB = typeOf(b.r) != T_LIQUID || hashV < fluidOf(b.r);
   if (rnd < 0.5) {
-    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
-    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && pairOk(a.r, d.r) && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && pairOk(b.r, c.r) && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
   } else {
-    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && pairOk(b.r, c.r) && (b.g & 0x80u) == 0u && viscOkB && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && pairOk(a.r, d.r) && (a.g & 0x80u) == 0u && viscOkA && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
   }
 
   // (L'étalement horizontal des liquides est traité par une passe dédiée, FLOW_FS.)

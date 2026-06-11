@@ -37,7 +37,7 @@ const toolSizeUnit = Math.max(1, Math.round(gridSize / 160));
 const MAX_TOOL_NOTCH = 5;
 let toolNotch = 3;
 
-const tools = ['void', 'water', 'sand', 'oil', 'alcool'];
+const tools = ['void', 'water', 'sand', 'oil', 'alcool', 'stone', 'wood', 'fire'];
 
 const mouse = {
   x: 0,
@@ -54,10 +54,13 @@ const mouse = {
 const TYPE_VOID = 0;
 const TYPE_SOLID = 1;
 const TYPE_LIQUID = 2;
+const TYPE_STATIC = 3; // immobile et indéplaçable (pierre)
+const TYPE_GAS = 4;    // monte, ondule, durée de vie (fumée, vapeur)
+const TYPE_FIRE = 5;   // brûle sur place, embrase, durée de vie
 
 function buildLookupTables() {
   const palette = new Uint8Array(256 * 4); // RGBA par id
-  const props = new Uint8Array(256 * 4);   // [densité, type, _, _] par id
+  const props = new Uint8Array(256 * 4);   // [densité, type, fluidité, inflammabilité]
 
   materials.forEach((mat, id) => {
     if (mat.color) {
@@ -69,8 +72,12 @@ function buildLookupTables() {
     }
     props[id * 4 + 0] = mat.density || 0;
     props[id * 4 + 2] = Math.round((mat.fluidity || 0) * 255);
+    props[id * 4 + 3] = mat.flammability || 0;
     if (mat.type === 'solid') props[id * 4 + 1] = TYPE_SOLID;
     else if (mat.type === 'liquid') props[id * 4 + 1] = TYPE_LIQUID;
+    else if (mat.type === 'static') props[id * 4 + 1] = TYPE_STATIC;
+    else if (mat.type === 'gas') props[id * 4 + 1] = TYPE_GAS;
+    else if (mat.type === 'fire') props[id * 4 + 1] = TYPE_FIRE;
     else props[id * 4 + 1] = TYPE_VOID;
   });
 
