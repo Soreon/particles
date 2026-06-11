@@ -32,6 +32,16 @@ class Sim {
     this.seed = seed | 0;
     this.grid = new Uint8Array(w * h);
     this.next = new Uint8Array(w * h);
+    // Charge utile par particule (structure-of-arrays, miroir des canaux
+    // .g/.b/.a de la texture RGBA8UI côté GPU). Transportée avec la particule
+    // dans tous les échanges. vy/vx : signe-magnitude (bit 7 = signe,
+    // valeur brute 0 = vitesse nulle — l'état neutre est le zéro).
+    this.vy = new Uint8Array(w * h);
+    this.vyN = new Uint8Array(w * h);
+    this.vx = new Uint8Array(w * h);
+    this.vxN = new Uint8Array(w * h);
+    this.fl = new Uint8Array(w * h);
+    this.flN = new Uint8Array(w * h);
     this.substepCounter = 0;
     this.flowCounter = 0;
     this.substepsPerFrame = 8;
@@ -39,10 +49,23 @@ class Sim {
     this.OFFSETS = [[0, 0], [1, 1], [1, 0], [0, 1]];
   }
 
+  // Rotation des doubles tampons (ids + charge utile), après chaque passe.
+  swapBuffers() {
+    let t = this.grid; this.grid = this.next; this.next = t;
+    t = this.vy; this.vy = this.vyN; this.vyN = t;
+    t = this.vx; this.vx = this.vxN; this.vxN = t;
+    t = this.fl; this.fl = this.flN; this.flN = t;
+  }
+
   // --- Passe de gravité : miroir exact de SIM_FS (bloc 2x2 de Margolus) ---
+  // Les origines (oa..od) sont permutées avec les valeurs : la charge utile
+  // suit sa particule structurellement (impossible d'oublier un canal).
   gravityStep(ox, oy, salt) {
-    const { w, h, grid, next } = this;
+    const { w, h, grid, next, vy, vyN, vx, vxN, fl, flN } = this;
     next.set(grid);
+    vyN.set(vy);
+    vxN.set(vx);
+    flN.set(fl);
     for (let y0 = oy; y0 + 1 < h; y0 += 2) {
       for (let x0 = ox; x0 + 1 < w; x0 += 2) {
         const i0 = y0 * w + x0;
@@ -51,34 +74,42 @@ class Sim {
         const i3 = i2 + 1;
         let a = grid[i0]; let b = grid[i1];
         let c = grid[i2]; let d = grid[i3];
+        let oa = i0; let ob = i1;
+        let oc = i2; let od = i3;
         let da = DENS[a]; let db = DENS[b];
         let dc = DENS[c]; let dd = DENS[d];
         const rnd = hash01(x0, y0, salt + this.seed * 7919);
         let t; let td;
 
         // 1. Coulée verticale : le plus dense descend dans chaque colonne.
-        if (da > dc) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
-        if (db > dd) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
+        if (da > dc) { t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t; }
+        if (db > dd) { t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t; }
 
         // 2. Diagonale quand la descente droite est bloquée.
         if (rnd < 0.5) {
-          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
-          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
+          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
         } else {
-          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
+          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
         }
 
         next[i0] = a; next[i1] = b; next[i2] = c; next[i3] = d;
+        vyN[i0] = vy[oa]; vyN[i1] = vy[ob]; vyN[i2] = vy[oc]; vyN[i3] = vy[od];
+        vxN[i0] = vx[oa]; vxN[i1] = vx[ob]; vxN[i2] = vx[oc]; vxN[i3] = vx[od];
+        flN[i0] = fl[oa]; flN[i1] = fl[ob]; flN[i2] = fl[oc]; flN[i3] = fl[od];
       }
     }
-    const tmp = this.grid; this.grid = this.next; this.next = tmp;
+    this.swapBuffers();
   }
 
   // --- Passe d'écoulement : paires 2x1, règle enfichable (miroir de FLOW_FS) ---
   flowStep(offsetX, salt) {
-    const { w, h, grid, next } = this;
+    const { w, h, grid, next, vy, vyN, vx, vxN, fl, flN } = this;
     next.set(grid);
+    vyN.set(vy);
+    vxN.set(vx);
+    flN.set(fl);
     const self = this;
 
     // Helpers identiques au shader (lecture depuis l'état AVANT la passe).
@@ -119,10 +150,13 @@ class Sim {
         if (self.flowRule(ctx)) {
           next[iL] = R;
           next[iR] = L;
+          vyN[iL] = vy[iR]; vyN[iR] = vy[iL];
+          vxN[iL] = vx[iR]; vxN[iR] = vx[iL];
+          flN[iL] = fl[iR]; flN[iR] = fl[iL];
         }
       }
     }
-    const tmp = this.grid; this.grid = this.next; this.next = tmp;
+    this.swapBuffers();
   }
 
   // --- Boucle de frame : miroir exact de frame() dans gpu.worker.js ---
@@ -139,8 +173,16 @@ class Sim {
   }
 
   // --- Outils de construction de scénarios ---
+  // Écrire une cellule remet sa charge utile à zéro (= le pinceau GPU qui
+  // stampe [id, 0, 0, 0]).
   set(x, y, id) {
-    if (x >= 0 && x < this.w && y >= 0 && y < this.h) this.grid[y * this.w + x] = id;
+    if (x >= 0 && x < this.w && y >= 0 && y < this.h) {
+      const i = y * this.w + x;
+      this.grid[i] = id;
+      this.vy[i] = 0;
+      this.vx[i] = 0;
+      this.fl[i] = 0;
+    }
   }
 
   get(x, y) {

@@ -62,13 +62,16 @@ let uRenderMouse = null;
 let uRenderToolSize = null;
 let uRenderDragging = null;
 let uRenderRingHalfWidth = null;
+let uRenderDebugView = null;
 // Demi-épaisseur de l'anneau du curseur, en texels : proportionnelle à la
 // résolution pour rester visible à l'écran, min 0.75 pour éviter les trous
 // (la distance max cercle->centre de cellule est ~0.707).
 let ringHalfWidth = 0.75;
+// Vue de debug du rendu : 0 = normal, 1 = vy, 2 = vx, 3 = flags.
+let debugView = 0;
 
-// Tampon CPU réutilisé pour estampiller le pinceau (taille max d'un disque r<=8).
-let brushPatch = new Uint8Array(1);
+// Tampon CPU réutilisé pour estampiller le pinceau (4 octets/texel : RGBA8UI).
+let brushPatch = new Uint8Array(4);
 
 // État souris reçu du thread principal (coordonnées en cases de la grille).
 const mouse = { x: -1, y: -1, toolSize: 1, dragging: false };
@@ -121,7 +124,11 @@ function createProgram(vsSource, fsSource) {
   return program;
 }
 
-// Crée une texture d'état R8UI initialisée avec `data` (Uint8Array) ou à zéro.
+// Crée une texture d'état RGBA8UI (4 octets/cellule : id, vy, vx, flags),
+// initialisée avec `data` (Uint8Array, 4 octets/texel) ou à zéro.
+// vy/vx : signe-magnitude (bit 7 = signe), la valeur brute 0 = vitesse nulle —
+// l'init à zéro de WebGL2 et les patchs du pinceau donnent donc l'état neutre.
+// NB : RGBA8UI est color-renderable garanti par la spec ; RGB8UI ne l'est PAS.
 function createStateTexture(data) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -130,8 +137,8 @@ function createStateTexture(data) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texImage2D(
-    gl.TEXTURE_2D, 0, gl.R8UI, gridWidth, gridHeight, 0,
-    gl.RED_INTEGER, gl.UNSIGNED_BYTE, data || null,
+    gl.TEXTURE_2D, 0, gl.RGBA8UI, gridWidth, gridHeight, 0,
+    gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, data || null,
   );
   return tex;
 }
@@ -196,11 +203,14 @@ uniform ivec2 uOffset;      // décalage du pavage (0/1 sur chaque axe)
 uniform ivec2 uGrid;
 uniform float uSeed;
 
-out uint outId;
+out uvec4 outCell;
 
 float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id)  { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
-uint fetch(ivec2 p)   { return texelFetch(uState, p, 0).r; }
+// Cellule complète : .r = id, .g = vy, .b = vx, .a = flags. Les échanges
+// portent sur la cellule ENTIÈRE : la charge utile suit structurellement
+// sa particule (impossible d'oublier un canal).
+uvec4 fetchCell(ivec2 p) { return texelFetch(uState, p, 0); }
 
 // Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
 // contrairement à sin() dont la réduction d'argument dépend du driver.
@@ -220,18 +230,18 @@ void main() {
 
   // Bloc qui déborde de la grille : on ne bouge pas (sera traité à un autre offset).
   if (corner.x < 0 || corner.y < 0 || corner.x + 1 >= uGrid.x || corner.y + 1 >= uGrid.y) {
-    outId = fetch(cell);
+    outCell = fetchCell(cell);
     return;
   }
 
   // a=TL, b=TR, c=BL, d=BR (y vers le bas : c/d = rangée du bas)
-  uint a = fetch(corner);
-  uint b = fetch(corner + ivec2(1, 0));
-  uint c = fetch(corner + ivec2(0, 1));
-  uint d = fetch(corner + ivec2(1, 1));
-  float da = densOf(a), db = densOf(b), dc = densOf(c), dd = densOf(d);
+  uvec4 a = fetchCell(corner);
+  uvec4 b = fetchCell(corner + ivec2(1, 0));
+  uvec4 c = fetchCell(corner + ivec2(0, 1));
+  uvec4 d = fetchCell(corner + ivec2(1, 1));
+  float da = densOf(a.r), db = densOf(b.r), dc = densOf(c.r), dd = densOf(d.r);
   float rnd = hash(corner);
-  uint t; float td;
+  uvec4 t; float td;
 
   // 1. Coulée verticale : le plus dense descend dans chaque colonne.
   if (da > dc) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
@@ -251,10 +261,10 @@ void main() {
   //  beaucoup plus efficace pour niveler que l'étalement intra-bloc.)
 
   // Chaque invocation ne sort que sa propre case du bloc.
-  if (lx == 0 && ly == 0) outId = a;
-  else if (lx == 1 && ly == 0) outId = b;
-  else if (lx == 0 && ly == 1) outId = c;
-  else outId = d;
+  if (lx == 0 && ly == 0) outCell = a;
+  else if (lx == 1 && ly == 0) outCell = b;
+  else if (lx == 0 && ly == 1) outCell = c;
+  else outCell = d;
 }`;
 
 // Passe d'écoulement / relaxation de densité (paires 2x1 de Margolus).
@@ -285,7 +295,7 @@ uniform int uOffsetX;
 uniform ivec2 uGrid;
 uniform float uSeed;
 
-out uint outId;
+out uvec4 outCell;
 
 const uint LIQUID = 2u;
 const int K = 2;  // portée du scan de dénivelé (exact : la décision sature à 2)
@@ -293,7 +303,10 @@ const int KS = 3; // portée du scan posé / en-transit
 
 float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id) { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
+// fetch : id seul (suffit aux scans) ; fetchCell : cellule complète (id + charge
+// utile vy/vx/flags), pour que l'échange transporte tous les canaux.
 uint fetch(ivec2 p)  { return texelFetch(uState, p, 0).r; }
+uvec4 fetchCell(ivec2 p) { return texelFetch(uState, p, 0); }
 
 // Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
 // contrairement à sin() dont la réduction d'argument dépend du driver.
@@ -332,16 +345,16 @@ void main() {
   ivec2 cell = ivec2(gl_FragCoord.xy);
   int lx = (cell.x - uOffsetX) & 1;
   int cornerX = cell.x - lx;
-  if (cornerX < 0 || cornerX + 1 >= uGrid.x) { outId = fetch(cell); return; }
+  if (cornerX < 0 || cornerX + 1 >= uGrid.x) { outCell = fetchCell(cell); return; }
 
   ivec2 lp = ivec2(cornerX, cell.y);
   ivec2 rp = ivec2(cornerX + 1, cell.y);
-  uint L = fetch(lp);
-  uint R = fetch(rp);
-  float dL = densOf(L);
-  float dR = densOf(R);
-  bool lLiq = typeOf(L) == LIQUID;
-  bool rLiq = typeOf(R) == LIQUID;
+  uvec4 L = fetchCell(lp);
+  uvec4 R = fetchCell(rp);
+  float dL = densOf(L.r);
+  float dR = densOf(R.r);
+  bool lLiq = typeOf(L.r) == LIQUID;
+  bool rLiq = typeOf(R.r) == LIQUID;
 
   bool doSwap = false;
 
@@ -353,10 +366,10 @@ void main() {
   //    rien : elle ne fait que tomber, et c'est ce qui déchiquetait en traits
   //    horizontaux les cavités de vide peintes au pinceau. Un tube de void se
   //    vide ainsi par le bas pendant que le vide sort par le haut.
-  if (lLiq && R == 0u && blockedBelow(lp) && openAbove(rp)
+  if (lLiq && R.r == 0u && blockedBelow(lp) && openAbove(rp)
       && (openAbove(lp) || blockedBelow(rp))) {
     doSwap = true;
-  } else if (rLiq && L == 0u && blockedBelow(rp) && openAbove(lp)
+  } else if (rLiq && L.r == 0u && blockedBelow(rp) && openAbove(lp)
       && (openAbove(rp) || blockedBelow(lp))) {
     doSwap = true;
   } else if (lLiq && rLiq && dL != dR) {
@@ -409,8 +422,8 @@ void main() {
     }
   }
 
-  if (doSwap) { uint t = L; L = R; R = t; }
-  outId = (lx == 0) ? L : R;
+  if (doSwap) { uvec4 t = L; L = R; R = t; }
+  outCell = (lx == 0) ? L : R;
 }`;
 
 // Passe de rendu — convertit les ids en couleurs via la palette, dessine le curseur.
@@ -427,20 +440,48 @@ uniform vec2 uMouse;     // position souris en cases (-1 si hors canvas)
 uniform int uToolSize;   // 1 = un point, >1 = anneau de rayon (toolSize-1)
 uniform int uDragging;
 uniform float uRingHalfWidth; // demi-épaisseur de l'anneau, en texels
+uniform int uDebugView;  // 0 = normal, 1 = vy, 2 = vx, 3 = flags
 
 out vec4 fragColor;
 
 const vec3 BG = vec3(0.063, 0.063, 0.078); // fond pour le vide (#101014)
 
+// Décodage signe-magnitude -> [-1, 1] (échelle /64).
+float sm(uint v) {
+  float m = float(v & 0x7Fu) / 64.0;
+  return ((v & 0x80u) != 0u) ? -m : m;
+}
+
 void main() {
   ivec2 cell = ivec2(int(gl_FragCoord.x), uGrid.y - 1 - int(gl_FragCoord.y));
-  uint id = texelFetch(uState, cell, 0).r;
+  uvec4 cellv = texelFetch(uState, cell, 0);
+  uint id = cellv.r;
 
   vec3 color;
   if (id == 0u) {
     color = BG;
   } else {
     color = texelFetch(uPalette, ivec2(int(id), 0), 0).rgb;
+  }
+
+  // Vues de debug des canaux cachés (la charge utile est invisible au rendu
+  // normal : sans ces vues, un canal perdu dans un échange serait indétectable).
+  if (uDebugView != 0 && id != 0u) {
+    if (uDebugView == 1) {
+      // vy : chaud (rouge/jaune) vers le bas, froid (cyan) vers le haut.
+      float v = sm(cellv.g);
+      color = v >= 0.0 ? vec3(min(1.0, v * 2.0), v, 0.05) : vec3(0.05, -v, min(1.0, -v * 2.0));
+      color += vec3(0.08); // les particules à vitesse nulle restent visibles
+    } else if (uDebugView == 2) {
+      // vx : rouge vers la droite, bleu vers la gauche.
+      float v = sm(cellv.b);
+      color = v >= 0.0 ? vec3(v, 0.1, 0.05) : vec3(0.05, 0.1, -v);
+      color += vec3(0.08);
+    } else {
+      // flags : 3 premiers bits -> R/G/B.
+      color = vec3(float(cellv.a & 1u), float((cellv.a >> 1) & 1u), float((cellv.a >> 2) & 1u));
+      color += vec3(0.08);
+    }
   }
 
   // Curseur : anneau (ou point) à la position souris.
@@ -473,6 +514,8 @@ function pickId(tool) {
 // Estampille un disque plein de centre (cx,cy) et de rayon (size-1) dans la
 // texture courante. Pour ne pas écraser l'existant hors-disque, on écrit ligne
 // par ligne le seul segment horizontal interne au disque (via texSubImage2D).
+// Chaque texel stampé = [id, vy=0, vx=0, flags=0] : la matière fraîchement
+// peinte naît à vitesse nulle (le 0 brut est l'état neutre en signe-magnitude).
 function paint(cx, cy, size, tool) {
   const r = size <= 1 ? 0 : size - 1;
   if (cx < 0 || cy < 0 || cx >= gridWidth || cy >= gridHeight) {
@@ -484,9 +527,12 @@ function paint(cx, cy, size, tool) {
 
   if (r === 0) {
     brushPatch[0] = pickId(tool);
+    brushPatch[1] = 0;
+    brushPatch[2] = 0;
+    brushPatch[3] = 0;
     gl.texSubImage2D(
       gl.TEXTURE_2D, 0, cx, cy, 1, 1,
-      gl.RED_INTEGER, gl.UNSIGNED_BYTE, brushPatch,
+      gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, brushPatch,
     );
     return;
   }
@@ -500,11 +546,17 @@ function paint(cx, cy, size, tool) {
     let segMaxX = cx + dxMax; if (segMaxX >= gridWidth) segMaxX = gridWidth - 1;
     if (segMinX > segMaxX) continue;
     const segW = segMaxX - segMinX + 1;
-    if (brushPatch.length < segW) brushPatch = new Uint8Array(segW);
-    for (let x = 0; x < segW; x++) brushPatch[x] = pickId(tool);
+    if (brushPatch.length < segW * 4) brushPatch = new Uint8Array(segW * 4);
+    for (let x = 0; x < segW; x++) {
+      const o = x * 4;
+      brushPatch[o] = pickId(tool);
+      brushPatch[o + 1] = 0;
+      brushPatch[o + 2] = 0;
+      brushPatch[o + 3] = 0;
+    }
     gl.texSubImage2D(
       gl.TEXTURE_2D, 0, segMinX, y, segW, 1,
-      gl.RED_INTEGER, gl.UNSIGNED_BYTE, brushPatch,
+      gl.RGBA_INTEGER, gl.UNSIGNED_BYTE, brushPatch,
     );
   }
 }
@@ -571,6 +623,7 @@ function render() {
   gl.uniform1i(uRenderToolSize, mouse.toolSize);
   gl.uniform1i(uRenderDragging, mouse.dragging ? 1 : 0);
   gl.uniform1f(uRenderRingHalfWidth, ringHalfWidth);
+  gl.uniform1i(uRenderDebugView, debugView);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
@@ -594,7 +647,14 @@ function initCounting() {
     countType = gl.UNSIGNED_BYTE;
     countArray = new Uint8Array(texels);
     countStep = 1;
+  } else if (f === gl.RGBA_INTEGER && t === gl.UNSIGNED_BYTE) {
+    // Chemin compact attendu pour un FBO RGBA8UI : 4 octets/texel, id en .r.
+    countFormat = gl.RGBA_INTEGER;
+    countType = gl.UNSIGNED_BYTE;
+    countArray = new Uint8Array(texels * 4);
+    countStep = 4;
   } else {
+    // Combinaison garantie par la spec (16 octets/texel — lourde, dernier recours).
     countFormat = gl.RGBA_INTEGER;
     countType = gl.UNSIGNED_INT;
     countArray = new Uint32Array(texels * 4);
@@ -723,6 +783,7 @@ function initialize(opts) {
   uRenderToolSize = gl.getUniformLocation(renderProgram, 'uToolSize');
   uRenderDragging = gl.getUniformLocation(renderProgram, 'uDragging');
   uRenderRingHalfWidth = gl.getUniformLocation(renderProgram, 'uRingHalfWidth');
+  uRenderDebugView = gl.getUniformLocation(renderProgram, 'uDebugView');
   ringHalfWidth = Math.max(0.75, 0.6 * (gridWidth / 160));
 
   // Lignes serrées pour tous les uploads (UNPACK_ALIGNMENT vaut 4 par défaut :
@@ -770,6 +831,9 @@ onmessage = ({ data }) => {
       mouse.y = args[1];
       mouse.toolSize = args[2];
       mouse.dragging = args[3];
+      break;
+    case 'debugView':
+      debugView = args[0];
       break;
     default:
       break;

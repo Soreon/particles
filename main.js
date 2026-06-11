@@ -102,8 +102,12 @@ function addDebugRow(label) {
   return valueEl;
 }
 
+let viewElement = null;
+
 function initializeDebugElements(toolIds) {
   addDebugRow('grid').textContent = gridWidth + 'x' + gridHeight;
+  viewElement = addDebugRow('view');
+  viewElement.textContent = 'normal';
   for (const name of Object.keys(toolIds)) {
     if (name === 'void') continue;
     countElements[name] = addDebugRow(name);
@@ -179,6 +183,18 @@ canvasElement.addEventListener('wheel', (e) => {
     toolElement.textContent = mouse.tool;
   }
 }, { passive: false });
+
+// Touche V : cycle des vues de debug du rendu (normal -> vy -> vx -> flags).
+// Visualise les canaux de vélocité, invisibles au rendu normal.
+const DEBUG_VIEWS = ['normal', 'vy', 'vx', 'flags'];
+let debugView = 0;
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'v' || e.key === 'V') {
+    debugView = (debugView + 1) % DEBUG_VIEWS.length;
+    gpuWorker.postMessage(['debugView', debugView]);
+    viewElement.textContent = DEBUG_VIEWS[debugView];
+  }
+});
 
 // Boucle d'entrée : envoie l'état souris (pour le curseur) et peint si on drague.
 setInterval(() => {
