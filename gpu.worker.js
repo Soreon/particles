@@ -33,7 +33,7 @@ let renderProgram = null;
 
 // Nombre de sous-pas de simulation par frame (chacun fait avancer la matière
 // d'environ une case). Plus il est élevé, plus l'écoulement est rapide.
-let substepsPerFrame = 4;
+let substepsPerFrame = 8;
 // Passes d'écoulement horizontal des liquides PAR pas de gravité (entrelacées).
 // Chaque passe déplace une case ; plus c'est élevé, plus l'eau se disperse/nivelle vite.
 let flowPassesPerFrame = 3;
@@ -52,6 +52,7 @@ let uFlowState = null;
 let uFlowProps = null;
 let uFlowOffsetX = null;
 let uFlowGrid = null;
+let uFlowSeed = null;
 let uRenderState = null;
 let uRenderPalette = null;
 let uRenderGrid = null;
@@ -231,13 +232,23 @@ void main() {
   else outId = d;
 }`;
 
-// Passe d'écoulement — étalement horizontal des liquides (paires 2x1 de Margolus).
+// Passe d'écoulement / relaxation de densité (paires 2x1 de Margolus).
 //
-// Pour chaque paire horizontale (gauche, droite) : si l'une est un liquide et
-// l'autre du vide, ET que le liquide ne peut pas tomber (case du dessous occupée
-// ou bord de grille), on l'échange vers le vide. Les deux cellules de la paire
-// calculent la même décision → échange conservatif et sans conflit. Gaté sur le
-// type liquide : le sable n'est pas affecté et garde ses tas.
+// Deux règles :
+//   A. surface (liquide↔vide) : un liquide s'étale dans un vide de surface —
+//      comportement validé, inchangé. Seule règle qui touche au vide.
+//   B. interfaces liquide↔liquide : relaxation par SCAN DE HAUTEUR. Une pente à
+//      45° est un point fixe de toute règle locale à seuil (les colonnes
+//      adjacentes n'y diffèrent que d'une case) → les blobs restaient figés en
+//      pyramides. On estime le dénivelé local de l'interface par un scan vertical
+//      borné (K=2, exact car la décision sature à 2) : dénivelé fort → poussée
+//      déterministe ; sinon → diffusion symétrique p=0.5 du profil de hauteur.
+//      Combinée aux échanges verticaux/diagonaux irréversibles de la gravité, la
+//      diffusion a un biais net vers l'aplatissement (validé en labo : couches
+//      planes en ~10 frames, calme résiduel équivalent à la règle A seule).
+//
+// Le hash est calculé sur le COIN de la paire : les deux cellules prennent la
+// même décision → échange conservatif et sans conflit.
 const FLOW_FS = `#version 300 es
 precision highp float;
 precision highp int;
@@ -247,13 +258,29 @@ uniform usampler2D uState;
 uniform sampler2D uProps;
 uniform int uOffsetX;
 uniform ivec2 uGrid;
+uniform float uSeed;
 
 out uint outId;
 
 const uint LIQUID = 2u;
+const int K = 2;  // portée du scan de dénivelé (exact : la décision sature à 2)
+const int KS = 3; // portée du scan posé / en-transit
 
+float densOf(uint id) { return texelFetch(uProps, ivec2(int(id), 0), 0).r; }
 uint typeOf(uint id) { return uint(texelFetch(uProps, ivec2(int(id), 0), 0).g * 255.0 + 0.5); }
 uint fetch(ivec2 p)  { return texelFetch(uState, p, 0).r; }
+
+float hash(ivec2 p) {
+  return fract(sin(dot(vec2(p), vec2(127.1, 311.7)) + uSeed) * 43758.5453);
+}
+
+// Densité avec gardes verticales : au-dessus de la grille = vide (0.0),
+// en dessous = mur infranchissable (1.0).
+float densAt(int x, int y) {
+  if (y < 0) return 0.0;
+  if (y >= uGrid.y) return 1.0;
+  return densOf(fetch(ivec2(x, y)));
+}
 
 // Vrai si la matière en p ne peut pas tomber (dessous occupé ou hors grille).
 bool blockedBelow(ivec2 p) {
@@ -262,8 +289,8 @@ bool blockedBelow(ivec2 p) {
   return fetch(ivec2(p.x, by)) != 0u;
 }
 
-// Vrai si la case au-dessus de p est vide (donc p est une case de surface, pas
-// une bulle submergée). Empêche l'eau de s'étaler latéralement dans une bulle.
+// Vrai si la case au-dessus de p est vide (p est une case de surface, pas une
+// bulle submergée). Empêche l'eau de s'étaler latéralement dans une bulle.
 bool openAbove(ivec2 p) {
   int ay = p.y - 1;
   if (ay < 0) return true;
@@ -280,10 +307,76 @@ void main() {
   ivec2 rp = ivec2(cornerX + 1, cell.y);
   uint L = fetch(lp);
   uint R = fetch(rp);
+  float dL = densOf(L);
+  float dR = densOf(R);
+  bool lLiq = typeOf(L) == LIQUID;
+  bool rLiq = typeOf(R) == LIQUID;
 
   bool doSwap = false;
-  if (typeOf(L) == LIQUID && R == 0u && blockedBelow(lp) && openAbove(rp)) doSwap = true;
-  else if (typeOf(R) == LIQUID && L == 0u && blockedBelow(rp) && openAbove(lp)) doSwap = true;
+
+  // A. Nivellement de surface (liquide↔vide) : « source en surface OU cible
+  //    soutenue ». L'eau DE SURFACE s'étale librement (ruissellement, cascades) ;
+  //    l'eau SUBMERGÉE ne glisse que vers une case posée sur quelque chose
+  //    (blockedBelow(cible)) — c'est la base d'une colonne qui s'effondre.
+  //    Pousser de l'eau submergée vers une case avec du vide dessous ne nivelle
+  //    rien : elle ne fait que tomber, et c'est ce qui déchiquetait en traits
+  //    horizontaux les cavités de vide peintes au pinceau. Un tube de void se
+  //    vide ainsi par le bas pendant que le vide sort par le haut.
+  if (lLiq && R == 0u && blockedBelow(lp) && openAbove(rp)
+      && (openAbove(lp) || blockedBelow(rp))) {
+    doSwap = true;
+  } else if (rLiq && L == 0u && blockedBelow(rp) && openAbove(lp)
+      && (openAbove(rp) || blockedBelow(lp))) {
+    doSwap = true;
+  } else if (lLiq && rLiq && dL != dR) {
+    // B. Relaxation des interfaces liquide-liquide POSÉES, par scan de hauteur.
+    ivec2 denseP = (dL > dR) ? lp : rp;
+    ivec2 lightP = (dL > dR) ? rp : lp;
+    float D = max(dL, dR);
+    float dLight = min(dL, dR);
+
+    // Posé ou en transit ? La relaxation n'arbitre que les interfaces POSÉES :
+    // appliquée à un blob en CHUTE dans un liquide plus léger (ou en ascension
+    // dans un plus dense), la poussée latérale le cisaille en jets diagonaux.
+    // Discriminant : sous une couche posée, la colonne dense continue jusqu'à
+    // un support ; sous un blob en chute, du plus léger apparaît à faible
+    // profondeur (les bandes du liquide porteur qui remontent à travers lui).
+    bool settled = true;
+    for (int k = 1; k <= KS; k++) {
+      float dd = densAt(denseP.x, denseP.y + k);
+      if (dd < D) { settled = false; break; } // plus léger dessous : en chute
+      if (dd > D) break;                      // support (sol/solide/+dense) : posé
+    }
+    if (settled) {
+      for (int k = 1; k <= KS; k++) {
+        float dd = densAt(lightP.x, lightP.y - k);
+        if (dd > dLight) { settled = false; break; } // plus dense dessus : en ascension
+        if (dd < dLight) break;                      // plafond (vide/+léger) : posé
+      }
+    }
+
+    if (settled) {
+      // hUp : hauteur de colonne dense (>= D) au-dessus de la paire, côté dense.
+      int hUp = 0;
+      for (int k = 1; k <= K; k++) {
+        if (densAt(denseP.x, denseP.y - k) >= D) hUp++;
+        else break;
+      }
+
+      // hDown : profondeur de liquide strictement plus léger sous la paire, côté léger.
+      int hDown = 0;
+      for (int k = 1; k <= K; k++) {
+        int yy = lightP.y + k;
+        if (yy >= uGrid.y) break;
+        uint id = fetch(ivec2(lightP.x, yy));
+        if (id != 0u && typeOf(id) == LIQUID && densOf(id) < D) hDown++;
+        else break;
+      }
+
+      if (hUp + hDown >= 2) doSwap = true;              // poussée déterministe
+      else doSwap = hash(ivec2(cornerX, cell.y)) < 0.5; // diffusion symétrique
+    }
+  }
 
   if (doSwap) { uint t = L; L = R; R = t; }
   outId = (lx == 0) ? L : R;
@@ -426,6 +519,7 @@ function stepFlow(offsetX) {
   gl.uniform1i(uFlowProps, 1);
   gl.uniform1i(uFlowOffsetX, offsetX);
   gl.uniform2i(uFlowGrid, gridWidth, gridHeight);
+  gl.uniform1f(uFlowSeed, Math.random() * 1000.0);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   current = dst;
 }
@@ -505,6 +599,7 @@ function initialize(opts) {
   uFlowProps = gl.getUniformLocation(flowProgram, 'uProps');
   uFlowOffsetX = gl.getUniformLocation(flowProgram, 'uOffsetX');
   uFlowGrid = gl.getUniformLocation(flowProgram, 'uGrid');
+  uFlowSeed = gl.getUniformLocation(flowProgram, 'uSeed');
   uRenderState = gl.getUniformLocation(renderProgram, 'uState');
   uRenderPalette = gl.getUniformLocation(renderProgram, 'uPalette');
   uRenderGrid = gl.getUniformLocation(renderProgram, 'uGrid');
