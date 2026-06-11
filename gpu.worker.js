@@ -65,6 +65,9 @@ let uFlowProps = null;
 let uFlowOffsetX = null;
 let uFlowGrid = null;
 let uFlowSeed = null;
+let uFlowSub = null;
+let uFlowPhase = null;
+let uFlowSubsteps = null;
 let uRenderState = null;
 let uRenderPalette = null;
 let uRenderGrid = null;
@@ -248,16 +251,64 @@ bool bres(uint m, int s) {
   return ((uint(s) + 1u) * mm) / S != (uint(s) * mm) / S;
 }
 
+const uint T_SOLID = 1u;
+const uint T_LIQUID = 2u;
+
+// Impact (transition transit -> posé) : conversion de la vitesse d'arrivée m.
+// Liquides : éclaboussure — éjection balistique (vy signé haut + vx latéral)
+// UNIQUEMENT vers de l'air libre, sinon fusion + glissade. Solides : petite
+// dispersion latérale (restitution ~0) — les colonnes deviennent des CÔNES.
+uvec4 impact(uvec4 me, ivec2 pos, uint m, bool airAbove) {
+  if (m < 3u) { me.g = 0u; return me; }
+  float j1 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x12345671u);
+  float j2 = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x89abcdefu);
+  uint sx = (j1 < 0.5) ? 0x80u : 0u;
+  uint S = uint(uSubsteps);
+  if (typeOf(me.r) == T_LIQUID) {
+    uint mx = min(m >> 1, max(2u, S >> 2));
+    if (airAbove && j2 < 0.5) {
+      uint mu = min(m >> 2, S >> 1);
+      me.g = (mu > 0u) ? (0x80u | mu) : 0u;
+    } else {
+      me.g = 0u;
+    }
+    me.b = (mx > 0u) ? (sx | mx) : 0u;
+  } else {
+    me.g = 0u;
+    uint mx = min(2u, m >> 2);
+    me.b = (mx > 0u) ? (sx | mx) : 0u;
+  }
+  return me;
+}
+
 // Mise à jour de la vélocité (une fois par frame, au sous-pas 0). Cycle de vie :
-//   - peut tomber (plus léger strictement dessous) : vy += G ± 1 (gravité
-//     stochastique), plafond S dans le vide, S/2 dans un liquide porteur ;
-//   - bloquée : vy := min(vy, vy_dessous) — file d'attente dans un jet, et
-//     pose (le posé a vy = 0) sans accumulation de vitesse fossile.
-// belowCell : cellule du dessous PRÉ-mise-à-jour ; floorBelow : sous la grille.
-uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, bool floorBelow) {
-  if (me.r == 0u) { me.g = 0u; return me; }
-  if (floorBelow) { me.g = 0u; return me; }
+//   - friction vx (jamais entretenu : pas de vitesse fossile) ;
+//   - montée balistique (gouttes éjectées) : décélération G, retombée à l'apex ;
+//   - peut tomber : vy += G ± 1 (gravité stochastique), plafond S dans le vide,
+//     S/2 dans un liquide porteur (vitesse terminale par milieu) ;
+//   - bloquée : file d'attente (vy := min) sur cible mobile, IMPACT sur posée.
+// belowCell/aboveCell : cellules PRÉ-mise-à-jour ; floorBelow : sous la grille.
+uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, uvec4 aboveCell, bool floorBelow, bool topAbove) {
+  if (me.r == 0u) { me.g = 0u; me.b = 0u; return me; }
+
+  uint mx = me.b & 0x7Fu;
+  if (mx > 0u) {
+    uint fr = (typeOf(me.r) == T_SOLID) ? 2u : 1u;
+    mx = (mx > fr) ? (mx - fr) : 0u;
+    me.b = (mx > 0u) ? ((me.b & 0x80u) | mx) : 0u;
+  }
+
   uint m = me.g & 0x7Fu;
+
+  if ((me.g & 0x80u) != 0u) {
+    bool aboveLighter = !topAbove && densOf(aboveCell.r) < densOf(me.r);
+    int mi = int(m) - uGravity;
+    me.g = (aboveLighter && mi > 0) ? (0x80u | uint(mi)) : 1u;
+    return me;
+  }
+
+  bool airAbove = !topAbove && aboveCell.r == 0u;
+  if (floorBelow) return impact(me, pos, m, airAbove);
   if (densOf(belowCell.r) < densOf(me.r)) {
     float j = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x9e3779b9u);
     int dm = uGravity + ((j < 0.33) ? -1 : ((j < 0.66) ? 0 : 1));
@@ -265,7 +316,9 @@ uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, bool floorBelow) {
     int mi = clamp(int(m) + dm, 1, cap);
     me.g = uint(mi);
   } else {
-    me.g = min(m, belowCell.g & 0x7Fu);
+    uint mb = belowCell.g & 0x7Fu;
+    if (mb == 0u) return impact(me, pos, m, airAbove);
+    me.g = min(m, mb);
   }
   return me;
 }
@@ -282,8 +335,10 @@ void main() {
     uvec4 me = fetchCell(cell);
     if (uFrameSub == 0) {
       bool floorB = cell.y + 1 >= uGrid.y;
+      bool topB = cell.y - 1 < 0;
       uvec4 below = floorB ? uvec4(0u) : fetchCell(cell + ivec2(0, 1));
-      me = updateVy(me, cell, below, floorB);
+      uvec4 above = topB ? uvec4(0u) : fetchCell(cell + ivec2(0, -1));
+      me = updateVy(me, cell, below, above, floorB, topB);
     }
     outCell = me;
     return;
@@ -300,12 +355,15 @@ void main() {
   // rangée sous le bloc). Chaque invocation met à jour les 4 identiquement.
   if (uFrameSub == 0) {
     bool floorBelow = corner.y + 2 >= uGrid.y;
+    bool topAbove = corner.y - 1 < 0;
     uvec4 belowC = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(0, 2));
     uvec4 belowD = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(1, 2));
-    uvec4 a2 = updateVy(a, corner, c, false);
-    uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, false);
-    c = updateVy(c, corner + ivec2(0, 1), belowC, floorBelow);
-    d = updateVy(d, corner + ivec2(1, 1), belowD, floorBelow);
+    uvec4 aboveA = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(0, -1));
+    uvec4 aboveB = topAbove ? uvec4(0u) : fetchCell(corner + ivec2(1, -1));
+    uvec4 a2 = updateVy(a, corner, c, aboveA, false, topAbove);
+    uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, aboveB, false, topAbove);
+    c = updateVy(c, corner + ivec2(0, 1), belowC, a, floorBelow, false);
+    d = updateVy(d, corner + ivec2(1, 1), belowD, b, floorBelow, false);
     a = a2;
     b = b2;
   }
@@ -317,33 +375,43 @@ void main() {
   // 0. Jitter de traînée : avec une faible probabilité, une particule EN CHUTE
   //    glisse en diagonale même si la chute droite est libre — seul mécanisme
   //    qui casse une colonne de largeur 1 (la diversité de vy ne le peut pas).
+  //    (les particules en ascension balistique en sont exclues)
   if (uJitterP > 0.0) {
     float jit = hash2(corner);
     if (jit < uJitterP) {
-      if (da > dd && dc > dd && bres(a.g & 0x7Fu, uFrameSub)) {
+      if (da > dd && dc > dd && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub)) {
         t = a; a = d; d = t; td = da; da = dd; dd = td;
-      } else if (db > dc && dd > dc && bres(b.g & 0x7Fu, uFrameSub)) {
+      } else if (db > dc && dd > dc && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub)) {
         t = b; b = c; c = t; td = db; db = dc; dc = td;
       }
     }
   }
 
   // 1. Coulée verticale : le plus dense descend dans chaque colonne, gatée par
-  //    l'échéancier de Bresenham du mouvant (vitesse réelle par particule).
-  if (da > dc && bres(a.g & 0x7Fu, uFrameSub)) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
-  if (db > dd && bres(b.g & 0x7Fu, uFrameSub)) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
+  //    l'échéancier du mouvant (qui ne doit pas être en ascension). Branche
+  //    symétrique : une particule ÉJECTÉE (vy signé haut) monte dans plus
+  //    léger qu'elle — l'arc balistique de l'éclaboussure.
+  {
+    bool aFall = da > dc && (a.g & 0x80u) == 0u && bres(a.g & 0x7Fu, uFrameSub);
+    bool cRise = (c.g & 0x80u) != 0u && dc > da && bres(c.g & 0x7Fu, uFrameSub);
+    if (aFall || cRise) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
+    bool bFall = db > dd && (b.g & 0x80u) == 0u && bres(b.g & 0x7Fu, uFrameSub);
+    bool dRise = (d.g & 0x80u) != 0u && dd > db && bres(d.g & 0x7Fu, uFrameSub);
+    if (bFall || dRise) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
+  }
 
   // 2. Diagonale quand la descente droite est bloquée (le dessous n'est pas
   //    plus léger). Dans le VIDE : cadence d'origine (éboulement des tas à
   //    l'air libre intact). Vers un LIQUIDE : gatée par l'échéancier du
   //    mouvant — sinon les avalanches diagonales en escalier descendent un
-  //    tas immergé à pleine cadence, comme dans du vide.
+  //    tas immergé à pleine cadence, comme dans du vide. Les particules en
+  //    ascension balistique en sont exclues.
   if (rnd < 0.5) {
-    if (da > dd && dc >= da && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
-    if (db > dc && dd >= db && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
   } else {
-    if (db > dc && dd >= db && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-    if (da > dd && dc >= da && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && (b.g & 0x80u) == 0u && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && (a.g & 0x80u) == 0u && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
   }
 
   // (L'étalement horizontal des liquides est traité par une passe dédiée, FLOW_FS.)
@@ -382,6 +450,9 @@ uniform sampler2D uProps;
 uniform int uOffsetX;
 uniform ivec2 uGrid;
 uniform float uSeed;
+uniform int uFlowSub;   // sous-pas de la frame (0..S-1), pour l'échéancier vx
+uniform int uFlowPhase; // laquelle des 3 passes du sous-pas (0..2)
+uniform int uSubsteps;  // S
 
 out uvec4 outCell;
 
@@ -404,6 +475,13 @@ float hash(ivec2 p) {
   h *= 2654435769u;
   h ^= h >> 16u;
   return float(h) * (1.0 / 4294967296.0);
+}
+
+// Échéancier de Bresenham (identique à SIM_FS) pour les mouvements vx.
+bool bres(uint m, int s) {
+  uint mm = max(m, 1u);
+  uint S = uint(uSubsteps);
+  return ((uint(s) + 1u) * mm) / S != (uint(s) * mm) / S;
 }
 
 // Densité avec gardes verticales : au-dessus de la grille = vide (0.0),
@@ -446,6 +524,20 @@ void main() {
 
   bool doSwap = false;
 
+  // 0. Mouvement vx (vélocité, première passe de chaque sous-pas) : une
+  //    particule à vitesse latérale se déplace vers une case VIDE adjacente
+  //    (uniquement — jamais dans un liquide : c'est le mécanisme qui
+  //    recréerait les jets en X), à l'échéancier de Bresenham de |vx|.
+  if (uFlowPhase == 0) {
+    uint mxL = L.b & 0x7Fu;
+    uint mxR = R.b & 0x7Fu;
+    if (L.r != 0u && R.r == 0u && mxL > 0u && (L.b & 0x80u) == 0u && bres(mxL, uFlowSub)) {
+      doSwap = true;
+    } else if (R.r != 0u && L.r == 0u && mxR > 0u && (R.b & 0x80u) != 0u && bres(mxR, uFlowSub)) {
+      doSwap = true;
+    }
+  }
+
   // A. Nivellement de surface (liquide↔vide) : « source en surface OU cible
   //    soutenue ». L'eau DE SURFACE s'étale librement (ruissellement, cascades) ;
   //    l'eau SUBMERGÉE ne glisse que vers une case posée sur quelque chose
@@ -454,13 +546,13 @@ void main() {
   //    rien : elle ne fait que tomber, et c'est ce qui déchiquetait en traits
   //    horizontaux les cavités de vide peintes au pinceau. Un tube de void se
   //    vide ainsi par le bas pendant que le vide sort par le haut.
-  if (lLiq && R.r == 0u && blockedBelow(lp) && openAbove(rp)
+  if (!doSwap && lLiq && R.r == 0u && blockedBelow(lp) && openAbove(rp)
       && (openAbove(lp) || blockedBelow(rp))) {
     doSwap = true;
-  } else if (rLiq && L.r == 0u && blockedBelow(rp) && openAbove(lp)
+  } else if (!doSwap && rLiq && L.r == 0u && blockedBelow(rp) && openAbove(lp)
       && (openAbove(rp) || blockedBelow(lp))) {
     doSwap = true;
-  } else if (lLiq && rLiq && dL != dR) {
+  } else if (!doSwap && lLiq && rLiq && dL != dR) {
     // B. Relaxation des interfaces liquide-liquide POSÉES, par scan de hauteur.
     ivec2 denseP = (dL > dR) ? lp : rp;
     ivec2 lightP = (dL > dR) ? rp : lp;
@@ -685,7 +777,9 @@ function stepSim(sFrame) {
 }
 
 // Un sous-pas d'écoulement horizontal des liquides (paires 2x1, offset alterné).
-function stepFlow(offsetX) {
+// sFrame/phase : sous-pas de la frame et index de passe (0..2) — les
+// mouvements vx sont tentés en phase 0 à l'échéancier de Bresenham.
+function stepFlow(offsetX, sFrame, phase) {
   const src = current;
   const dst = 1 - current;
   gl.bindFramebuffer(gl.FRAMEBUFFER, stateFbo[dst]);
@@ -700,6 +794,9 @@ function stepFlow(offsetX) {
   gl.uniform1i(uFlowOffsetX, offsetX);
   gl.uniform2i(uFlowGrid, gridWidth, gridHeight);
   gl.uniform1f(uFlowSeed, Math.random() * 1000.0);
+  gl.uniform1i(uFlowSub, sFrame);
+  gl.uniform1i(uFlowPhase, phase);
+  gl.uniform1i(uFlowSubsteps, substepsPerFrame);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   current = dst;
 }
@@ -815,7 +912,7 @@ function frame(now) {
   for (let s = 0; s < substepsPerFrame; s++) {
     stepSim(s);
     for (let f = 0; f < flowPassesPerFrame; f++) {
-      stepFlow(flowCounter & 1);
+      stepFlow(flowCounter & 1, s, f);
       flowCounter++;
     }
   }
@@ -882,6 +979,9 @@ function initialize(opts) {
   uFlowOffsetX = gl.getUniformLocation(flowProgram, 'uOffsetX');
   uFlowGrid = gl.getUniformLocation(flowProgram, 'uGrid');
   uFlowSeed = gl.getUniformLocation(flowProgram, 'uSeed');
+  uFlowSub = gl.getUniformLocation(flowProgram, 'uFlowSub');
+  uFlowPhase = gl.getUniformLocation(flowProgram, 'uFlowPhase');
+  uFlowSubsteps = gl.getUniformLocation(flowProgram, 'uSubsteps');
   uRenderState = gl.getUniformLocation(renderProgram, 'uState');
   uRenderPalette = gl.getUniformLocation(renderProgram, 'uPalette');
   uRenderGrid = gl.getUniformLocation(renderProgram, 'uGrid');

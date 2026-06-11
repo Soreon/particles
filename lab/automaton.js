@@ -3,7 +3,7 @@
 // La passe d'écoulement est enfichable (lab/rules/*.js) pour comparer des
 // variantes de règles sur les mêmes scénarios.
 
-const { DENS, TYPE, T_LIQUID, MATERIAL_IDS } = require('./materials');
+const { DENS, TYPE, T_SOLID, T_LIQUID, MATERIAL_IDS } = require('./materials');
 
 // Hash déterministe -> [0,1) (équivalent du hash() des shaders).
 function hash01(x, y, salt) {
@@ -84,8 +84,39 @@ class Sim {
   //   - bloquée (dessous pas plus léger) : vy := min(vy, vy_dessous) — file
   //     d'attente dans un jet (transfert), et pose (le posé a vy=0) sans
   //     jamais accumuler de vitesse fossile.
+  // Impact (transition transit -> posé, cible posée ou sol) : conversion de la
+  // vitesse verticale d'arrivée m. Liquides : éclaboussure — une partie des
+  // gouttes est ÉJECTÉE balistiquement (vy signé vers le haut + vx latéral),
+  // le reste glisse en surface (vx seul). Solides : petite dispersion latérale
+  // (restitution ~0) — c'est elle qui transforme les colonnes en CÔNES.
+  applyImpact(i, x, y, id, m, salt) {
+    if (m < 3) { this.vy[i] = 0; return; } // atterrissage doux : simple pose
+    const S = this.substepsPerFrame;
+    const j1 = hash01(x, y, salt ^ 0x12345671);
+    const j2 = hash01(x, y, salt ^ 0x89abcdef);
+    const sx = j1 < 0.5 ? 0x80 : 0; // signe latéral aléatoire (0x80 = gauche)
+    if (TYPE[id] === T_LIQUID) {
+      const mx = Math.min(m >> 1, Math.max(2, S >> 2));
+      // Éjection balistique UNIQUEMENT vers de l'air libre : une goutte qui
+      // percute une couche immergée (huile au fond de l'alcool) ne doit pas
+      // rebondir À TRAVERS le liquide du dessus.
+      const airAbove = y - 1 >= 0 && this.grid[i - this.w] === 0;
+      if (airAbove && j2 < 0.5) {
+        const mu = Math.min(m >> 2, S >> 1); // éjection : repart vers le haut
+        this.vy[i] = mu > 0 ? (0x80 | mu) : 0;
+      } else {
+        this.vy[i] = 0; // fusion dans la surface
+      }
+      this.vx[i] = mx > 0 ? (sx | mx) : 0;
+    } else {
+      this.vy[i] = 0;
+      const mx = Math.min(2, m >> 2);
+      this.vx[i] = mx > 0 ? (sx | mx) : 0;
+    }
+  }
+
   velocityUpdate(salt) {
-    const { w, h, grid, vy, vyN } = this;
+    const { w, h, grid, vy, vyN, vx } = this;
     const S = this.substepsPerFrame;
     // Plafond en liquide : S/2 stocké -> ~S/4 effectif. Une particule lente ne
     // tombe qu'à ~m/2 par frame (taxe d'alignement : ses sous-pas programmés ne
@@ -96,9 +127,30 @@ class Sim {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
         const id = grid[i];
-        if (id === 0) { vy[i] = 0; continue; }
-        let m = vyN[i] & 0x7F;
-        if (y + 1 >= h) { vy[i] = 0; continue; } // posé sur le sol
+        if (id === 0) { vy[i] = 0; vx[i] = 0; continue; }
+
+        // Friction latérale (une fois par frame) : les solides s'arrêtent vite,
+        // les liquides glissent. vx n'est jamais entretenu (pas de fossile).
+        const mxOld = vx[i] & 0x7F;
+        if (mxOld > 0) {
+          const fr = TYPE[id] === T_SOLID ? 2 : 1;
+          const mx = mxOld - fr;
+          vx[i] = mx > 0 ? ((vx[i] & 0x80) | mx) : 0;
+        }
+
+        const v = vyN[i];
+        let m = v & 0x7F;
+
+        // Montée balistique (gouttes éjectées) : décélération G, retombée au
+        // sommet de l'arc ou sous un plafond.
+        if ((v & 0x80) !== 0) {
+          const aboveLighter = y - 1 >= 0 && DENS[grid[i - w]] < DENS[id];
+          m -= this.G;
+          vy[i] = (aboveLighter && m > 0) ? (0x80 | m) : 1;
+          continue;
+        }
+
+        if (y + 1 >= h) { this.applyImpact(i, x, y, id, m, salt); continue; }
         const below = grid[i + w];
         if (DENS[below] < DENS[id]) {
           // Chute possible : gravité stochastique, plafond selon le milieu.
@@ -107,12 +159,13 @@ class Sim {
           const cap = below === 0 ? S : capLiquid;
           if (m < 1) m = 1;
           if (m > cap) m = cap;
+          vy[i] = m;
         } else {
-          // Bloquée : file d'attente / pose.
+          // Bloquée : file d'attente sur une cible mobile, impact sur une posée.
           const mBelow = vyN[i + w] & 0x7F;
-          if (m > mBelow) m = mBelow;
+          if (mBelow === 0) this.applyImpact(i, x, y, id, m, salt);
+          else vy[i] = Math.min(m, mBelow);
         }
-        vy[i] = m; // signe 0 = vers le bas (les remontées restent non modélisées)
       }
     }
   }
@@ -153,21 +206,29 @@ class Sim {
         if (ev && this.jitterP > 0) {
           const jit = hash01(x0, y0, salt ^ 0x5bd1e995);
           if (jit < this.jitterP) {
-            if (da > dd && dc > dd && this.bres(vy[oa] & 0x7F, sFrame)) {
+            if (da > dd && dc > dd && (vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame)) {
               t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t;
-            } else if (db > dc && dd > dc && this.bres(vy[ob] & 0x7F, sFrame)) {
+            } else if (db > dc && dd > dc && (vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame)) {
               t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t;
             }
           }
         }
 
-        // 1. Coulée verticale : le plus dense descend dans chaque colonne.
-        //    Avec vélocité : gatée par l'échéancier de Bresenham du mouvant.
-        if (da > dc && (!ev || this.bres(vy[oa] & 0x7F, sFrame))) {
-          t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t;
-        }
-        if (db > dd && (!ev || this.bres(vy[ob] & 0x7F, sFrame))) {
-          t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
+        // 1. Coulée verticale : le plus dense descend dans chaque colonne,
+        //    gatée par l'échéancier du mouvant (qui ne doit pas être en
+        //    ascension). Branche symétrique : une particule ÉJECTÉE (vy signé
+        //    haut) monte dans plus léger qu'elle — l'arc balistique du splash.
+        {
+          const aFall = da > dc && (!ev || ((vy[oa] & 0x80) === 0 && this.bres(vy[oa] & 0x7F, sFrame)));
+          const cRise = ev && (vy[oc] & 0x80) !== 0 && dc > da && this.bres(vy[oc] & 0x7F, sFrame);
+          if (aFall || cRise) {
+            t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t;
+          }
+          const bFall = db > dd && (!ev || ((vy[ob] & 0x80) === 0 && this.bres(vy[ob] & 0x7F, sFrame)));
+          const dRise = ev && (vy[od] & 0x80) !== 0 && dd > db && this.bres(vy[od] & 0x7F, sFrame);
+          if (bFall || dRise) {
+            t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
+          }
         }
 
         // 2. Diagonale quand la descente droite est bloquée.
@@ -175,8 +236,9 @@ class Sim {
         //    est un liquide (sinon les avalanches diagonales en escalier
         //    descendent un tas immergé à pleine cadence, comme dans du vide).
         //    Dans le vide/air : cadence d'origine (éboulement des tas intact).
-        const gA = () => !ev || d === 0 || this.bres(vy[oa] & 0x7F, sFrame);
-        const gB = () => !ev || c === 0 || this.bres(vy[ob] & 0x7F, sFrame);
+        // (les particules en ascension balistique sont exclues des diagonales)
+        const gA = () => !ev || ((vy[oa] & 0x80) === 0 && (d === 0 || this.bres(vy[oa] & 0x7F, sFrame)));
+        const gB = () => !ev || ((vy[ob] & 0x80) === 0 && (c === 0 || this.bres(vy[ob] & 0x7F, sFrame)));
         if (rnd < 0.5) {
           if (da > dd && dc >= da && gA()) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
           if (db > dc && dd >= db && gB()) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
@@ -195,13 +257,18 @@ class Sim {
   }
 
   // --- Passe d'écoulement : paires 2x1, règle enfichable (miroir de FLOW_FS) ---
-  flowStep(offsetX, salt) {
+  // sFrame/phase (vélocité) : les mouvements vx sont tentés sur la première
+  // des 3 passes de chaque sous-pas (phase 0), avec le même échéancier de
+  // Bresenham que vy — vx est donc en cases/frame, comme vy, quelle que soit
+  // la résolution.
+  flowStep(offsetX, salt, sFrame = 0, phase = 0) {
     const { w, h, grid, next, vy, vyN, vx, vxN, fl, flN } = this;
     next.set(grid);
     vyN.set(vy);
     vxN.set(vx);
     flN.set(fl);
     const self = this;
+    const ev = this.engineVelocity;
 
     // Helpers identiques au shader (lecture depuis l'état AVANT la passe).
     const densAt = (x, y) => {
@@ -221,6 +288,25 @@ class Sim {
         const L = grid[iL];
         const R = grid[iR];
         if (L === R) continue;
+
+        // Mouvement vx (vélocité, phase 0) : une particule à vitesse latérale
+        // se déplace vers une case VIDE adjacente (uniquement — jamais dans un
+        // liquide : c'est le mécanisme qui recréerait les jets en X).
+        if (ev && phase === 0) {
+          const mxL = vx[iL] & 0x7F;
+          const mxR = vx[iR] & 0x7F;
+          let vxSwap = false;
+          if (L !== 0 && R === 0 && mxL > 0 && (vx[iL] & 0x80) === 0 && self.bres(mxL, sFrame)) vxSwap = true;
+          else if (R !== 0 && L === 0 && mxR > 0 && (vx[iR] & 0x80) !== 0 && self.bres(mxR, sFrame)) vxSwap = true;
+          if (vxSwap) {
+            next[iL] = R; next[iR] = L;
+            vyN[iL] = vy[iR]; vyN[iR] = vy[iL];
+            vxN[iL] = vx[iR]; vxN[iR] = vx[iL];
+            flN[iL] = fl[iR]; flN[iR] = fl[iL];
+            continue;
+          }
+        }
+
         const ctx = {
           L,
           R,
@@ -257,7 +343,7 @@ class Sim {
       this.substepCounter++;
       this.gravityStep(off[0], off[1], this.substepCounter, s);
       for (let f = 0; f < this.flowPassesPerStep; f++) {
-        this.flowStep(this.flowCounter & 1, 7777 + this.flowCounter);
+        this.flowStep(this.flowCounter & 1, 7777 + this.flowCounter, s, f);
         this.flowCounter++;
       }
     }
