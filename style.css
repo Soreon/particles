@@ -3,25 +3,51 @@
   src: url(pixel.ttf);
 }
 
+/* --- Plein écran sombre : le canvas occupe le maximum de la fenêtre, le
+   panneau (outils + compteurs) vit à sa droite. --- */
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #0c0c10;
+  color: #c8c8d2;
+}
+
+body {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 10px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
 #canvas {
-    width: 800px;
-    height: 800px;
-    image-rendering: -moz-crisp-edges;
-    image-rendering: -webkit-crisp-edges;
-    image-rendering: pixelated;
-    image-rendering: crisp-edges;
-    cursor: none;
-    border: 1px solid #EEE;
+  /* dimensionné par main.js : remplit la zone disponible au format de la grille */
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  cursor: none;
+  border: 1px solid #2c2c34;
+  background: #101014;
+}
+
+#panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 240px;
+  flex-shrink: 0;
 }
 
 /* --- Barre d'outils pixel art --- */
 
 #toolbar {
-  width: 800px;
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  padding: 6px 0;
 }
 
 .toolBtn {
@@ -66,57 +92,54 @@
   border: 1px solid #000;
 }
 
-body {
-  display: flex;
-  flex-direction: column;
-}
-
-.row {
-  display: flex;
-  flex-direction: row;
-}
-
-#infos {
-  font-family: pixel;
-  font-size: 8px;
-  user-select: none;
-}
+/* --- Panneau de compteurs --- */
 
 #debug {
-  display: inline-block;
-  flex: 1;
   user-select: none;
+  padding: 6px 8px;
+  background: #14141a;
+  border: 2px solid #2c2c34;
 }
 
 .debugRow {
   display: flex;
   font-family: pixel;
   font-size: 8px;
+  line-height: 14px;
 }
 
 .debugLabel {
   flex: 1;
-  max-width: 100px;
+  max-width: 110px;
+  color: #8a8a96;
 }
 
 .debugValue {
   flex: 1;
+  color: #d8d8e2;
+}
+
+#infos {
+  font-family: pixel;
+  font-size: 8px;
+  color: #6a6a76;
+  user-select: none;
+  line-height: 14px;
 }
 
 #fps-counter {
   position: fixed;
-  top: 10px;
-  left: 10px;
+  top: 16px;
+  left: 16px;
   font-family: pixel;
   font-size: 8px;
-  color: #666;
-  background-color: rgba(255, 255, 255, 0.8);
-  padding: 2px 6px;
-  border-radius: 3px;
+  color: #9a9aa4;
+  background: rgba(16, 16, 22, 0.85);
+  border: 1px solid #2c2c34;
+  padding: 3px 7px;
   user-select: none;
   z-index: 1000;
-  opacity: 0.7;
-  transition: opacity 0.2s ease;
+  opacity: 0.8;
 }
 
 #fps-counter:hover {

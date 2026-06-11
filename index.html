@@ -5,19 +5,19 @@
   <meta charset="UTF-8">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Document</title>
+  <title>Particles</title>
   <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
-  <div class="row">
-    <canvas id="canvas" width="800" height="800"></canvas>
+  <canvas id="canvas" width="800" height="800"></canvas>
+  <div id="panel">
+    <div id="toolbar"></div>
     <div id="debug">
       <div class="debugRow"><span class="debugLabel">Tool: </span><span id="tool" class="debugValue"></span></div>
     </div>
+    <div id="infos">Click or 1-0: tool&nbsp;&nbsp;·&nbsp;&nbsp;Wheel: brush size&nbsp;&nbsp;·&nbsp;&nbsp;V: debug view</div>
   </div>
-  <div id="toolbar"></div>
-  <div id="infos" class="row">Click: change tool,&nbsp;&nbsp;&nbsp;&nbsp;Wheel: change brush size</div>
   <div id="fps-counter">FPS: <span id="fps-value">0</span></div>
   <script type="module" src="main.js"></script>
 </body>

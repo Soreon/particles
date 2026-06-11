@@ -19,12 +19,18 @@ const debugElement = document.getElementById('debug');
 const fpsElement = document.getElementById('fps-value');
 
 const urlParams = new URLSearchParams(window.location.search);
+// ?grid= fixe la HAUTEUR de grille ; la largeur est déduite du format de la
+// fenêtre (zone disponible à côté du panneau) -> la simulation épouse l'écran.
 // Clamp [32, 2048] (MAX_TEXTURE_SIZE garanti >= 2048 en WebGL2) et arrondi au
 // multiple de 4 : valeurs négatives/énormes/farfelues -> échec opaque sinon.
+const clampGrid = (v) => Math.round(Math.min(2048, Math.max(32, v)) / 4) * 4;
+const PANEL_SPACE = 278; // panneau 240 + gouttières/padding
+const availW = Math.max(320, window.innerWidth - PANEL_SPACE);
+const availH = Math.max(320, window.innerHeight - 20);
 const requestedGrid = parseInt(urlParams.get('grid'), 10) || 320;
-const gridSize = Math.round(Math.min(2048, Math.max(32, requestedGrid)) / 4) * 4;
-const gridWidth = gridSize;
-const gridHeight = gridSize;
+const gridHeight = clampGrid(requestedGrid);
+const gridWidth = clampGrid(Math.round(gridHeight * (availW / availH)));
+const gridSize = gridHeight; // référence d'échelle (chute, pinceau)
 
 // La gravité fait tomber d'une case par sous-pas : on scale les sous-pas avec
 // la grille pour une vitesse visuelle ~constante (8 sous-pas à 160).
@@ -37,7 +43,9 @@ const toolSizeUnit = Math.max(1, Math.round(gridSize / 160));
 const MAX_TOOL_NOTCH = 5;
 let toolNotch = 3;
 
-const tools = ['void', 'water', 'sand', 'oil', 'alcool', 'stone', 'wood', 'fire'];
+// Les 10 premiers outils ont un raccourci clavier (touches 1..9, 0).
+const tools = ['void', 'water', 'sand', 'oil', 'alcool', 'stone', 'wood', 'fire', 'lava', 'powder', 'ice', 'plant'];
+const TOOL_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
 
 const mouse = {
   x: 0,
@@ -166,10 +174,11 @@ function selectTool(name) {
 }
 
 function initializeToolbar(toolIds) {
-  for (const name of tools) {
+  tools.forEach((name, idx) => {
     const btn = document.createElement('div');
     btn.className = 'toolBtn';
-    btn.title = name;
+    const key = idx < TOOL_KEYS.length ? TOOL_KEYS[idx] : null;
+    btn.title = key ? `${name} (${key})` : name;
 
     const swatch = document.createElement('canvas');
     swatch.width = 10;
@@ -178,16 +187,18 @@ function initializeToolbar(toolIds) {
     btn.appendChild(swatch);
 
     const label = document.createElement('span');
-    label.textContent = name;
+    label.textContent = key ? `${key} ${name}` : name;
     btn.appendChild(label);
 
     btn.addEventListener('click', () => selectTool(name));
     toolbarElement.appendChild(btn);
     toolButtons[name] = btn;
 
-    // le feu vacille : son échantillon est redessiné en continu
-    if (name === 'fire') setInterval(() => drawSwatch(swatch, 'fire', toolIds), 280);
-  }
+    // le feu et la lave vacillent : échantillons redessinés en continu
+    if (name === 'fire' || name === 'lava') {
+      setInterval(() => drawSwatch(swatch, name, toolIds), 280);
+    }
+  });
 }
 
 // --- Démarrage ---
@@ -197,13 +208,35 @@ const toolIds = buildToolIds();
 initializeDebugElements(toolIds);
 initializeToolbar(toolIds);
 
-// clientWidth/clientLeft excluent la bordure 1px du canvas (rect.width = 802) :
-// sans ça, le pinceau dérive de 1-2 cases au bord droit/bas aux grandes grilles.
-const rect = canvasElement.getBoundingClientRect();
-const displayLeft = rect.left + canvasElement.clientLeft;
-const displayTop = rect.top + canvasElement.clientTop;
-const displayWidth = canvasElement.clientWidth;
-const displayHeight = canvasElement.clientHeight;
+// clientWidth/clientLeft excluent la bordure 1px du canvas : sans ça, le
+// pinceau dérive de 1-2 cases au bord droit/bas aux grandes grilles.
+// Le canvas est dimensionné par la fenêtre (plein écran) : on re-mesure à
+// chaque redimensionnement.
+let displayLeft = 0;
+let displayTop = 0;
+let displayWidth = 1;
+let displayHeight = 1;
+
+function updateDisplayMetrics() {
+  const rect = canvasElement.getBoundingClientRect();
+  displayLeft = rect.left + canvasElement.clientLeft;
+  displayTop = rect.top + canvasElement.clientTop;
+  displayWidth = canvasElement.clientWidth;
+  displayHeight = canvasElement.clientHeight;
+}
+
+// Dimensionne le canvas pour remplir la zone disponible en respectant
+// EXACTEMENT le format de la grille (cellules carrées, pas d'étirement).
+function fitCanvas() {
+  const w = Math.max(320, window.innerWidth - PANEL_SPACE);
+  const h = Math.max(320, window.innerHeight - 20);
+  const scale = Math.min(w / gridWidth, h / gridHeight);
+  canvasElement.style.width = `${Math.floor(gridWidth * scale)}px`;
+  canvasElement.style.height = `${Math.floor(gridHeight * scale)}px`;
+  updateDisplayMetrics();
+}
+fitCanvas();
+window.addEventListener('resize', fitCanvas);
 
 const offscreen = canvasElement.transferControlToOffscreen();
 const gpuWorker = new Worker('gpu.worker.js');
@@ -250,14 +283,21 @@ canvasElement.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // Touche V : cycle des vues de debug du rendu (normal -> vy -> vx -> flags).
-// Visualise les canaux de vélocité, invisibles au rendu normal.
+// Touches 1..9, 0 : sélection directe d'outil (via e.code Digit*, indépendant
+// de la disposition clavier — sur AZERTY les chiffres non shiftés marchent).
 const DEBUG_VIEWS = ['normal', 'vy', 'vx', 'flags'];
 let debugView = 0;
 window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
   if (e.key === 'v' || e.key === 'V') {
     debugView = (debugView + 1) % DEBUG_VIEWS.length;
     gpuWorker.postMessage(['debugView', debugView]);
     viewElement.textContent = DEBUG_VIEWS[debugView];
+    return;
+  }
+  if (e.code.startsWith('Digit')) {
+    const idx = TOOL_KEYS.indexOf(e.code.slice(5));
+    if (idx >= 0 && idx < tools.length) selectTool(tools[idx]);
   }
 });
 
