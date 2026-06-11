@@ -55,7 +55,9 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  padding: 3px 5px 2px;
+  width: 74px; /* taille FIXE : toutes les cases identiques (3 par rangée) */
+  box-sizing: border-box;
+  padding: 3px 0 2px;
   background: #1a1a20;
   border: 2px solid #3a3a44;
   border-radius: 0; /* pixel art : angles durs */
@@ -65,6 +67,13 @@ body {
   font-size: 8px;
   color: #9a9aa4;
   box-shadow: 1px 1px 0 #000; /* relief 8-bit */
+  overflow: hidden;
+}
+
+.toolBtn span {
+  max-width: 70px;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .toolBtn:hover {
