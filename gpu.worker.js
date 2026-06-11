@@ -50,6 +50,16 @@ let uSimProps = null;
 let uSimOffset = null;
 let uSimGrid = null;
 let uSimSeed = null;
+let uSimFrameSub = null;
+let uSimSubsteps = null;
+let uSimGravity = null;
+let uSimJitterP = null;
+
+// Accélération (cases/frame²) : échelle avec les sous-pas pour un ressenti
+// identique à toute résolution (référence labo : G=1 pour S=8).
+let gravityG = 1;
+// Probabilité de glissade de traînée en vol (anti-colonne de largeur 1).
+const JITTER_P = 0.08;
 let uFlowState = null;
 let uFlowProps = null;
 let uFlowOffsetX = null;
@@ -202,6 +212,10 @@ uniform sampler2D uProps;   // 256x1 : .r = densité (UNORM), .g = type*1/255
 uniform ivec2 uOffset;      // décalage du pavage (0/1 sur chaque axe)
 uniform ivec2 uGrid;
 uniform float uSeed;
+uniform int uFrameSub;      // index du sous-pas DANS la frame (0..S-1)
+uniform int uSubsteps;      // S : sous-pas par frame (= vitesse terminale)
+uniform int uGravity;       // G : accélération, en cases/frame²
+uniform float uJitterP;     // probabilité de glissade de traînée en vol
 
 out uvec4 outCell;
 
@@ -214,12 +228,46 @@ uvec4 fetchCell(ivec2 p) { return texelFetch(uState, p, 0); }
 
 // Hash entier (Wang) : précision exacte quelle que soit la taille de grille,
 // contrairement à sin() dont la réduction d'argument dépend du driver.
-float hash(ivec2 p) {
-  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + floatBitsToUint(uSeed);
+float hashSeeded(ivec2 p, uint seed) {
+  uint h = uint(p.x) * 1664525u + uint(p.y) * 1013904223u + seed;
   h ^= h >> 16u;
   h *= 2654435769u;
   h ^= h >> 16u;
   return float(h) * (1.0 / 4294967296.0);
+}
+float hash(ivec2 p)  { return hashSeeded(p, floatBitsToUint(uSeed)); }
+float hash2(ivec2 p) { return hashSeeded(p, floatBitsToUint(uSeed) ^ 0x5bd1e995u); }
+
+// Échéancier de Bresenham temporel : une particule de magnitude m (cases/
+// frame) tente sa chute au sous-pas s ssi le quotient entier (s·m)/S change.
+// Arithmétique entière non signée : exacte, identique entre les invocations
+// d'un bloc et la réplique CPU. m plancher à 1 (pas de particule suspendue).
+bool bres(uint m, int s) {
+  uint mm = max(m, 1u);
+  uint S = uint(uSubsteps);
+  return ((uint(s) + 1u) * mm) / S != (uint(s) * mm) / S;
+}
+
+// Mise à jour de la vélocité (une fois par frame, au sous-pas 0). Cycle de vie :
+//   - peut tomber (plus léger strictement dessous) : vy += G ± 1 (gravité
+//     stochastique), plafond S dans le vide, S/2 dans un liquide porteur ;
+//   - bloquée : vy := min(vy, vy_dessous) — file d'attente dans un jet, et
+//     pose (le posé a vy = 0) sans accumulation de vitesse fossile.
+// belowCell : cellule du dessous PRÉ-mise-à-jour ; floorBelow : sous la grille.
+uvec4 updateVy(uvec4 me, ivec2 pos, uvec4 belowCell, bool floorBelow) {
+  if (me.r == 0u) { me.g = 0u; return me; }
+  if (floorBelow) { me.g = 0u; return me; }
+  uint m = me.g & 0x7Fu;
+  if (densOf(belowCell.r) < densOf(me.r)) {
+    float j = hashSeeded(pos, floatBitsToUint(uSeed) ^ 0x9e3779b9u);
+    int dm = uGravity + ((j < 0.33) ? -1 : ((j < 0.66) ? 0 : 1));
+    int cap = (belowCell.r == 0u) ? uSubsteps : max(1, uSubsteps >> 1);
+    int mi = clamp(int(m) + dm, 1, cap);
+    me.g = uint(mi);
+  } else {
+    me.g = min(m, belowCell.g & 0x7Fu);
+  }
+  return me;
 }
 
 void main() {
@@ -228,9 +276,16 @@ void main() {
   int ly = (cell.y - uOffset.y) & 1;
   ivec2 corner = ivec2(cell.x - lx, cell.y - ly); // coin haut-gauche du bloc
 
-  // Bloc qui déborde de la grille : on ne bouge pas (sera traité à un autre offset).
+  // Bloc qui déborde de la grille : pas de mouvement, mais la mise à jour de
+  // vélocité s'applique quand même (toutes les cellules, une fois par frame).
   if (corner.x < 0 || corner.y < 0 || corner.x + 1 >= uGrid.x || corner.y + 1 >= uGrid.y) {
-    outCell = fetchCell(cell);
+    uvec4 me = fetchCell(cell);
+    if (uFrameSub == 0) {
+      bool floorB = cell.y + 1 >= uGrid.y;
+      uvec4 below = floorB ? uvec4(0u) : fetchCell(cell + ivec2(0, 1));
+      me = updateVy(me, cell, below, floorB);
+    }
+    outCell = me;
     return;
   }
 
@@ -239,26 +294,59 @@ void main() {
   uvec4 b = fetchCell(corner + ivec2(1, 0));
   uvec4 c = fetchCell(corner + ivec2(0, 1));
   uvec4 d = fetchCell(corner + ivec2(1, 1));
+
+  // Mise à jour de la vélocité au sous-pas 0, AVANT les échanges, à partir des
+  // valeurs pré-mise-à-jour (a/b lisent c/d tels que fetchés ; c/d lisent la
+  // rangée sous le bloc). Chaque invocation met à jour les 4 identiquement.
+  if (uFrameSub == 0) {
+    bool floorBelow = corner.y + 2 >= uGrid.y;
+    uvec4 belowC = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(0, 2));
+    uvec4 belowD = floorBelow ? uvec4(0u) : fetchCell(corner + ivec2(1, 2));
+    uvec4 a2 = updateVy(a, corner, c, false);
+    uvec4 b2 = updateVy(b, corner + ivec2(1, 0), d, false);
+    c = updateVy(c, corner + ivec2(0, 1), belowC, floorBelow);
+    d = updateVy(d, corner + ivec2(1, 1), belowD, floorBelow);
+    a = a2;
+    b = b2;
+  }
+
   float da = densOf(a.r), db = densOf(b.r), dc = densOf(c.r), dd = densOf(d.r);
   float rnd = hash(corner);
   uvec4 t; float td;
 
-  // 1. Coulée verticale : le plus dense descend dans chaque colonne.
-  if (da > dc) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
-  if (db > dd) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
-
-  // 2. Diagonale quand la descente droite est bloquée (le dessous n'est pas plus léger).
-  //    Ordre des deux diagonales choisi par l'aléa pour éviter tout biais gauche/droite.
-  if (rnd < 0.5) {
-    if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
-    if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-  } else {
-    if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
-    if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+  // 0. Jitter de traînée : avec une faible probabilité, une particule EN CHUTE
+  //    glisse en diagonale même si la chute droite est libre — seul mécanisme
+  //    qui casse une colonne de largeur 1 (la diversité de vy ne le peut pas).
+  if (uJitterP > 0.0) {
+    float jit = hash2(corner);
+    if (jit < uJitterP) {
+      if (da > dd && dc > dd && bres(a.g & 0x7Fu, uFrameSub)) {
+        t = a; a = d; d = t; td = da; da = dd; dd = td;
+      } else if (db > dc && dd > dc && bres(b.g & 0x7Fu, uFrameSub)) {
+        t = b; b = c; c = t; td = db; db = dc; dc = td;
+      }
+    }
   }
 
-  // (L'étalement horizontal des liquides est traité par une passe dédiée, FLOW_FS,
-  //  beaucoup plus efficace pour niveler que l'étalement intra-bloc.)
+  // 1. Coulée verticale : le plus dense descend dans chaque colonne, gatée par
+  //    l'échéancier de Bresenham du mouvant (vitesse réelle par particule).
+  if (da > dc && bres(a.g & 0x7Fu, uFrameSub)) { t = a; a = c; c = t; td = da; da = dc; dc = td; }
+  if (db > dd && bres(b.g & 0x7Fu, uFrameSub)) { t = b; b = d; d = t; td = db; db = dd; dd = td; }
+
+  // 2. Diagonale quand la descente droite est bloquée (le dessous n'est pas
+  //    plus léger). Dans le VIDE : cadence d'origine (éboulement des tas à
+  //    l'air libre intact). Vers un LIQUIDE : gatée par l'échéancier du
+  //    mouvant — sinon les avalanches diagonales en escalier descendent un
+  //    tas immergé à pleine cadence, comme dans du vide.
+  if (rnd < 0.5) {
+    if (da > dd && dc >= da && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+    if (db > dc && dd >= db && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+  } else {
+    if (db > dc && dd >= db && (c.r == 0u || bres(b.g & 0x7Fu, uFrameSub))) { t = b; b = c; c = t; td = db; db = dc; dc = td; }
+    if (da > dd && dc >= da && (d.r == 0u || bres(a.g & 0x7Fu, uFrameSub))) { t = a; a = d; d = t; td = da; da = dd; dd = td; }
+  }
+
+  // (L'étalement horizontal des liquides est traité par une passe dédiée, FLOW_FS.)
 
   // Chaque invocation ne sort que sa propre case du bloc.
   if (lx == 0 && ly == 0) outCell = a;
@@ -527,7 +615,9 @@ function paint(cx, cy, size, tool) {
 
   if (r === 0) {
     brushPatch[0] = pickId(tool);
-    brushPatch[1] = 0;
+    // Émission randomisée (vy initial 0..3) : désynchronise les particules à
+    // la source — le levier anti-colonnes le plus puissant (Noita/Powder Toy).
+    brushPatch[1] = (Math.random() * 4) | 0;
     brushPatch[2] = 0;
     brushPatch[3] = 0;
     gl.texSubImage2D(
@@ -550,7 +640,7 @@ function paint(cx, cy, size, tool) {
     for (let x = 0; x < segW; x++) {
       const o = x * 4;
       brushPatch[o] = pickId(tool);
-      brushPatch[o + 1] = 0;
+      brushPatch[o + 1] = (Math.random() * 4) | 0; // émission randomisée
       brushPatch[o + 2] = 0;
       brushPatch[o + 3] = 0;
     }
@@ -566,7 +656,9 @@ function paint(cx, cy, size, tool) {
 // ---------------------------------------------------------------------------
 
 // Un sous-pas de simulation : lit la texture courante, écrit l'autre, échange.
-function stepSim() {
+// sFrame : index du sous-pas dans la frame (0..S-1), pour l'échéancier de
+// Bresenham et la mise à jour de vélocité (au sous-pas 0).
+function stepSim(sFrame) {
   const offset = OFFSETS[substepCounter % OFFSETS.length];
   substepCounter++;
 
@@ -584,6 +676,10 @@ function stepSim() {
   gl.uniform2i(uSimOffset, offset[0], offset[1]);
   gl.uniform2i(uSimGrid, gridWidth, gridHeight);
   gl.uniform1f(uSimSeed, Math.random() * 1000.0);
+  gl.uniform1i(uSimFrameSub, sFrame);
+  gl.uniform1i(uSimSubsteps, substepsPerFrame);
+  gl.uniform1i(uSimGravity, gravityG);
+  gl.uniform1f(uSimJitterP, JITTER_P);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   current = dst;
 }
@@ -717,12 +813,17 @@ function frame(now) {
   // Gravité et écoulement ENTRELACÉS : après chaque étalement latéral, la gravité
   // suivante fait retomber l'eau (cascade : descend → s'étale → redescend → plat).
   for (let s = 0; s < substepsPerFrame; s++) {
-    stepSim();
+    stepSim(s);
     for (let f = 0; f < flowPassesPerFrame; f++) {
       stepFlow(flowCounter & 1);
       flowCounter++;
     }
   }
+  // Dérive de phase des offsets (+1 « sous-pas fantôme » par frame) : sans elle,
+  // l'échéancier d'une vitesse m diviseur de S retombe chaque frame sur les
+  // MÊMES offsets de Margolus, et une particule lente à parité défavorable ne
+  // serait jamais appariée verticalement avec sa case du dessous (figée).
+  substepCounter++;
   render();
 
   frameIndex++;
@@ -748,6 +849,7 @@ function initialize(opts) {
   gridHeight = opts.gridHeight;
   toolIds = opts.toolIds;
   if (opts.substepsPerFrame) substepsPerFrame = opts.substepsPerFrame;
+  gravityG = Math.max(1, Math.round(substepsPerFrame / 8));
 
   canvas.width = gridWidth;
   canvas.height = gridHeight;
@@ -770,6 +872,10 @@ function initialize(opts) {
   uSimOffset = gl.getUniformLocation(simProgram, 'uOffset');
   uSimGrid = gl.getUniformLocation(simProgram, 'uGrid');
   uSimSeed = gl.getUniformLocation(simProgram, 'uSeed');
+  uSimFrameSub = gl.getUniformLocation(simProgram, 'uFrameSub');
+  uSimSubsteps = gl.getUniformLocation(simProgram, 'uSubsteps');
+  uSimGravity = gl.getUniformLocation(simProgram, 'uGravity');
+  uSimJitterP = gl.getUniformLocation(simProgram, 'uJitterP');
 
   uFlowState = gl.getUniformLocation(flowProgram, 'uState');
   uFlowProps = gl.getUniformLocation(flowProgram, 'uProps');

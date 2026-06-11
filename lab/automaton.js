@@ -30,6 +30,14 @@ class Sim {
     this.h = h;
     this.flowRule = flowRule;
     this.seed = seed | 0;
+    // Moteur de vélocité (V2+) : activé par la règle via flowRule.engine.
+    // velocity : vy mis à jour à s=0 (gravité, file d'attente, pose) et chute
+    // verticale gatée par Bresenham temporel. G : accélération (cases/frame²).
+    // jitterP : probabilité de glissade diagonale de traînée en vol.
+    const eng = (flowRule && flowRule.engine) || {};
+    this.engineVelocity = !!eng.velocity;
+    this.G = eng.G || 1;
+    this.jitterP = eng.jitterP || 0;
     this.grid = new Uint8Array(w * h);
     this.next = new Uint8Array(w * h);
     // Charge utile par particule (structure-of-arrays, miroir des canaux
@@ -57,11 +65,68 @@ class Sim {
     t = this.fl; this.fl = this.flN; this.flN = t;
   }
 
+  // Échéancier de Bresenham temporel : une particule de magnitude m (cases/
+  // frame) tente sa chute au sous-pas s ssi le quotient entier (s·m)/S change.
+  // m est plancher à 1 pour qu'aucune particule capable de tomber ne reste
+  // suspendue (le cas vy=0 sous-frame, avant la mise à jour suivante).
+  bres(m, sFrame) {
+    const S = this.substepsPerFrame;
+    const mm = m > 0 ? m : 1;
+    return (((sFrame + 1) * mm / S) | 0) !== ((sFrame * mm / S) | 0);
+  }
+
+  // Mise à jour de la vélocité, une fois par frame (au sous-pas s=0), à partir
+  // d'un instantané pré-mise-à-jour (vyN sert de scratch — miroir du GPU qui
+  // lit la texture source). Cycle de vie :
+  //   - peut tomber (plus léger strictement dessous) : vy += G ± 1 (gravité
+  //     stochastique pour faire diverger les vy égaux), plafonnée à S dans le
+  //     vide, S/4 dans un liquide porteur (vitesse terminale par milieu) ;
+  //   - bloquée (dessous pas plus léger) : vy := min(vy, vy_dessous) — file
+  //     d'attente dans un jet (transfert), et pose (le posé a vy=0) sans
+  //     jamais accumuler de vitesse fossile.
+  velocityUpdate(salt) {
+    const { w, h, grid, vy, vyN } = this;
+    const S = this.substepsPerFrame;
+    // Plafond en liquide : S/2 stocké -> ~S/4 effectif. Une particule lente ne
+    // tombe qu'à ~m/2 par frame (taxe d'alignement : ses sous-pas programmés ne
+    // coïncident avec le bon appariement Margolus qu'une frame sur deux).
+    const capLiquid = Math.max(1, S >> 1);
+    vyN.set(vy); // instantané pré-mise-à-jour
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        const id = grid[i];
+        if (id === 0) { vy[i] = 0; continue; }
+        let m = vyN[i] & 0x7F;
+        if (y + 1 >= h) { vy[i] = 0; continue; } // posé sur le sol
+        const below = grid[i + w];
+        if (DENS[below] < DENS[id]) {
+          // Chute possible : gravité stochastique, plafond selon le milieu.
+          const j = hash01(x, y, salt + this.seed * 31337);
+          m += this.G + (j < 0.33 ? -1 : (j < 0.66 ? 0 : 1));
+          const cap = below === 0 ? S : capLiquid;
+          if (m < 1) m = 1;
+          if (m > cap) m = cap;
+        } else {
+          // Bloquée : file d'attente / pose.
+          const mBelow = vyN[i + w] & 0x7F;
+          if (m > mBelow) m = mBelow;
+        }
+        vy[i] = m; // signe 0 = vers le bas (les remontées restent non modélisées)
+      }
+    }
+  }
+
   // --- Passe de gravité : miroir exact de SIM_FS (bloc 2x2 de Margolus) ---
   // Les origines (oa..od) sont permutées avec les valeurs : la charge utile
   // suit sa particule structurellement (impossible d'oublier un canal).
-  gravityStep(ox, oy, salt) {
+  gravityStep(ox, oy, salt, sFrame) {
     const { w, h, grid, next, vy, vyN, vx, vxN, fl, flN } = this;
+    const ev = this.engineVelocity;
+
+    // Mise à jour de la vélocité une fois par frame, avant les échanges.
+    if (ev && sFrame === 0) this.velocityUpdate(salt);
+
     next.set(grid);
     vyN.set(vy);
     vxN.set(vx);
@@ -81,17 +146,43 @@ class Sim {
         const rnd = hash01(x0, y0, salt + this.seed * 7919);
         let t; let td;
 
+        // 0. Jitter de traînée (vélocité) : avec une faible probabilité, une
+        //    particule EN CHUTE glisse en diagonale même si la chute droite est
+        //    libre — seul mécanisme qui casse une colonne de largeur 1 (la
+        //    diversité de vy ne le peut pas : pas de doublement possible).
+        if (ev && this.jitterP > 0) {
+          const jit = hash01(x0, y0, salt ^ 0x5bd1e995);
+          if (jit < this.jitterP) {
+            if (da > dd && dc > dd && this.bres(vy[oa] & 0x7F, sFrame)) {
+              t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t;
+            } else if (db > dc && dd > dc && this.bres(vy[ob] & 0x7F, sFrame)) {
+              t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t;
+            }
+          }
+        }
+
         // 1. Coulée verticale : le plus dense descend dans chaque colonne.
-        if (da > dc) { t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t; }
-        if (db > dd) { t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t; }
+        //    Avec vélocité : gatée par l'échéancier de Bresenham du mouvant.
+        if (da > dc && (!ev || this.bres(vy[oa] & 0x7F, sFrame))) {
+          t = a; a = c; c = t; td = da; da = dc; dc = td; t = oa; oa = oc; oc = t;
+        }
+        if (db > dd && (!ev || this.bres(vy[ob] & 0x7F, sFrame))) {
+          t = b; b = d; d = t; td = db; db = dd; dd = td; t = ob; ob = od; od = t;
+        }
 
         // 2. Diagonale quand la descente droite est bloquée.
+        //    Vélocité : gatée par l'échéancier du mouvant quand la DESTINATION
+        //    est un liquide (sinon les avalanches diagonales en escalier
+        //    descendent un tas immergé à pleine cadence, comme dans du vide).
+        //    Dans le vide/air : cadence d'origine (éboulement des tas intact).
+        const gA = () => !ev || d === 0 || this.bres(vy[oa] & 0x7F, sFrame);
+        const gB = () => !ev || c === 0 || this.bres(vy[ob] & 0x7F, sFrame);
         if (rnd < 0.5) {
-          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
-          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
+          if (da > dd && dc >= da && gA()) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
+          if (db > dc && dd >= db && gB()) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
         } else {
-          if (db > dc && dd >= db) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
-          if (da > dd && dc >= da) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
+          if (db > dc && dd >= db && gB()) { t = b; b = c; c = t; td = db; db = dc; dc = td; t = ob; ob = oc; oc = t; }
+          if (da > dd && dc >= da && gA()) { t = a; a = d; d = t; td = da; da = dd; dd = td; t = oa; oa = od; od = t; }
         }
 
         next[i0] = a; next[i1] = b; next[i2] = c; next[i3] = d;
@@ -164,25 +255,37 @@ class Sim {
     for (let s = 0; s < this.substepsPerFrame; s++) {
       const off = this.OFFSETS[this.substepCounter % 4];
       this.substepCounter++;
-      this.gravityStep(off[0], off[1], this.substepCounter);
+      this.gravityStep(off[0], off[1], this.substepCounter, s);
       for (let f = 0; f < this.flowPassesPerStep; f++) {
         this.flowStep(this.flowCounter & 1, 7777 + this.flowCounter);
         this.flowCounter++;
       }
     }
+    // Mode vélocité : dérive de phase des offsets (+1 « sous-pas fantôme » par
+    // frame). Sans elle, l'échéancier de Bresenham d'une vitesse m diviseur de
+    // S retombe chaque frame sur les MÊMES sous-pas, donc les MÊMES offsets de
+    // Margolus (S multiple de 4) : une particule lente à parité défavorable ne
+    // serait jamais appariée verticalement avec sa case du dessous → figée.
+    if (this.engineVelocity) this.substepCounter++;
   }
 
   // --- Outils de construction de scénarios ---
-  // Écrire une cellule remet sa charge utile à zéro (= le pinceau GPU qui
-  // stampe [id, 0, 0, 0]).
-  set(x, y, id) {
+  // Écrire une cellule remet sa charge utile à zéro, sauf vy optionnel :
+  // avec le moteur de vélocité, le pinceau émet des vitesses initiales
+  // randomisées (0..3) — le levier anti-colonnes le plus puissant
+  // (désynchronisation à la source, standard Noita/Powder Toy).
+  set(x, y, id, vy0 = 0) {
     if (x >= 0 && x < this.w && y >= 0 && y < this.h) {
       const i = y * this.w + x;
       this.grid[i] = id;
-      this.vy[i] = 0;
+      this.vy[i] = vy0;
       this.vx[i] = 0;
       this.fl[i] = 0;
     }
+  }
+
+  emitVy(rng) {
+    return this.engineVelocity ? (rng() * 4) | 0 : 0;
   }
 
   get(x, y) {
@@ -193,7 +296,7 @@ class Sim {
     const ids = MATERIAL_IDS[material];
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        this.set(x, y, ids[(rng() * ids.length) | 0]);
+        this.set(x, y, ids[(rng() * ids.length) | 0], this.emitVy(rng));
       }
     }
   }
@@ -204,7 +307,7 @@ class Sim {
     for (let y = cy - r; y <= cy + r; y++) {
       for (let x = cx - r; x <= cx + r; x++) {
         const dx = x - cx; const dy = y - cy;
-        if (dx * dx + dy * dy <= r2) this.set(x, y, ids[(rng() * ids.length) | 0]);
+        if (dx * dx + dy * dy <= r2) this.set(x, y, ids[(rng() * ids.length) | 0], this.emitVy(rng));
       }
     }
   }
